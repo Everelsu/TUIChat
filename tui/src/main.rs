@@ -55,7 +55,9 @@ async fn main() -> io::Result<()> {
     let config = Config::load();
     let server = args.server.unwrap_or_else(|| config.server.clone());
     let room_arg = args.room.unwrap_or_else(|| config.room.clone());
-    let nick_arg = args.nick.or_else(|| config.nickname.clone());
+    // Ник из аргументов означает «войти сразу», из настроек — только
+    // подставить в поле.
+    let nick_arg = args.nick.clone();
 
     // Аргументы проверяем до запуска интерфейса: сообщение об ошибке в обычном
     // терминале читается лучше, чем красная строка внутри TUI.
@@ -64,6 +66,10 @@ async fn main() -> io::Result<()> {
         Some(Err(err)) => fail(err),
         None => None,
     };
+    let remembered = config
+        .nickname
+        .as_deref()
+        .and_then(|nickname| validate::clean_nickname(nickname).ok());
     let room = match validate::clean_room(&room_arg) {
         Ok(room) => room,
         Err(err) => fail(err),
@@ -119,6 +125,7 @@ async fn main() -> io::Result<()> {
         config,
         server,
         nickname,
+        remembered,
         room,
         hosted,
     )
@@ -160,6 +167,7 @@ async fn run(
     mut config: Config,
     url: String,
     nickname: Option<String>,
+    remembered: Option<String>,
     room: String,
     hosted: Option<Hosted>,
 ) -> io::Result<()> {
@@ -167,6 +175,9 @@ async fn run(
     spawn_input(actions.clone());
 
     let (mut state, startup) = State::new(nickname, room);
+    if let Some(remembered) = &remembered {
+        state.prefill_nickname(remembered);
+    }
     // Цвета переносим из настроек в состояние: рисование не должно лезть
     // в файлы, а команда /color правит уже готовую таблицу.
     state.last_dir = config.last_dir.clone();
