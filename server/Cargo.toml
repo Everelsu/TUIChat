@@ -1,0 +1,21 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+common.workspace = true
+futures-util = "0.3.31"
+if-addrs = "0.15.0"
+rcgen = "0.14.9"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "io-util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite = "0.30.0"

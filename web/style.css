@@ -1,0 +1,355 @@
+/* Веб-клиент повторяет вид терминального: моноширинный шрифт, прямые углы,
+   палитра ников совпадает с TUI. Один и тот же человек выглядит одинаково
+   и в терминале, и в браузере. */
+
+:root {
+  --bg: #0b0f0e;
+  --panel: #0f1513;
+  --fg: #d6e4d8;
+  --muted: #6b7d70;
+  --line: #1f2a25;
+  --accent: #d97757;
+  --error: #ff6b6b;
+  --mention: #ffcc66;
+  --mine: #131c18;
+  /* Высота экранной клавиатуры: пересчитывается из JS. */
+  --keyboard: 0px;
+
+  /* Палитра ников — те же шесть цветов, что в терминальном клиенте. */
+  --nick-0: #5ebab0;
+  --nick-1: #7eba80;
+  --nick-2: #d6ad60;
+  --nick-3: #b294d6;
+  --nick-4: #729fcf;
+  --nick-5: #d68080;
+
+  /* Системные элементы — плеер, полосы прокрутки, выпадающие списки — должны
+     совпадать с темой страницы, а не оставаться светлыми на тёмном. */
+  color-scheme: dark;
+}
+
+/* Светлая тема — тоже терминал, только на бумаге. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfaf5;
+    --panel: #f2f0e8;
+    --fg: #1f2320;
+    --muted: #6f7770;
+    --line: #ddd9cc;
+    --accent: #c05621;
+    --error: #b3261e;
+    --mention: #8a6100;
+    --mine: #eef1e8;
+
+    --nick-0: #067a86;
+    --nick-1: #1a7f3c;
+    --nick-2: #8a6100;
+    --nick-3: #9c27b0;
+    --nick-4: #1f5fbf;
+    --nick-5: #c0392b;
+
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Атрибут hidden обязан побеждать наши display: flex. Без этого скрытые
+   экраны остаются на виду: правило автора сильнее, чем [hidden] из браузера. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono",
+    Consolas, "Liberation Mono", monospace;
+}
+
+body {
+  /* 100dvh, а не 100vh: иначе на мобильных нижняя панель браузера
+     срезает поле ввода. */
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: var(--keyboard);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* Экран входа */
+
+.join {
+  margin: auto;
+  padding: 20px;
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.join h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.join h1::before {
+  content: "┌─ ";
+  color: var(--line);
+}
+
+.join h1::after {
+  content: " ─────────────────";
+  color: var(--line);
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--fg);
+  /* Не меньше 16px: иначе Safari на iOS зумит страницу при фокусе. */
+  font: inherit;
+  font-size: 16px;
+}
+
+input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+
+button {
+  padding: 10px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 15px;
+  /* Палец промахивается по мелким целям — минимум 44px по высоте. */
+  min-height: 44px;
+  cursor: pointer;
+}
+
+button:active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.error {
+  margin: 0;
+  color: var(--error);
+  font-size: 13px;
+}
+
+.error::before {
+  content: "!  ";
+}
+
+/* Экран чата */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  padding-top: calc(8px + env(safe-area-inset-top));
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.room {
+  color: var(--accent);
+}
+
+/* Кнопка со счётчиком участников: тап разворачивает список. */
+.people {
+  padding: 2px 8px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.users {
+  margin: 0;
+  padding: 8px 12px;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 13px;
+}
+
+.users .me {
+  color: var(--accent);
+}
+
+.status {
+  margin: 0;
+  padding: 5px 12px;
+  background: var(--panel);
+  color: var(--error);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  text-align: center;
+}
+
+.messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 8px 12px;
+  list-style: none;
+  overscroll-behavior: contain;
+  /* Длинные ссылки не должны распирать колонку. */
+  overflow-wrap: anywhere;
+}
+
+.messages li {
+  padding: 1px 4px;
+}
+
+.messages .mine {
+  background: var(--mine);
+}
+
+/* Упоминание своего ника не должно теряться в потоке. */
+.messages .mention {
+  border-left: 2px solid var(--mention);
+  background: var(--mine);
+  padding-left: 2px;
+}
+
+.messages .system {
+  color: var(--muted);
+}
+
+.messages .system.bad {
+  color: var(--error);
+}
+
+.time {
+  color: var(--muted);
+  margin-right: 6px;
+}
+
+.nick {
+  margin-right: 6px;
+}
+
+.composer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+/* Приглашение ко вводу — как в терминале. */
+.composer::before {
+  content: ">";
+  color: var(--accent);
+}
+
+.composer input {
+  flex: 1;
+  border-color: transparent;
+  background: transparent;
+  padding: 10px 0;
+}
+
+.composer input:focus-visible {
+  border-color: transparent;
+}
+
+.composer button {
+  width: 48px;
+  min-height: 40px;
+}
+
+.attach {
+  border-color: var(--line);
+  color: var(--muted);
+  font-size: 20px;
+}
+
+.tools {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Идёт запись: кнопка должна быть заметна, иначе легко забыть выключить. */
+#record.recording {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.people[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.messages audio {
+  display: block;
+  margin-top: 4px;
+  width: min(320px, 100%);
+  height: 36px;
+}
+
+/* Превью держим небольшим: лента должна оставаться лентой, а не галереей. */
+.messages img {
+  display: block;
+  margin-top: 4px;
+  max-width: min(320px, 100%);
+  max-height: 320px;
+  border: 1px solid var(--line);
+  cursor: zoom-in;
+}
+
+.messages .file {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* Подсветка во время перетаскивания файла в окно. */
+.chat.dropping .messages {
+  outline: 1px dashed var(--accent);
+  outline-offset: -4px;
+}

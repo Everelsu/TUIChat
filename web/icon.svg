@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Чат">
+  <!-- Поля по краям: маскируемая иконка на Android обрезается по кругу. -->
+  <rect width="512" height="512" fill="#0b0f0e" />
+  <rect x="96" y="128" width="320" height="256" rx="16" fill="none" stroke="#1f2a25" stroke-width="12" />
+  <path d="M144 208 l40 40 -40 40" fill="none" stroke="#45e07f" stroke-width="24"
+        stroke-linecap="square" stroke-linejoin="miter" />
+  <rect x="208" y="272" width="112" height="20" fill="#45e07f" />
+</svg>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover — чтобы на телефонах с вырезом фон доходил до краёв,
+         а отступы считались через safe-area-inset. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0b0f0e" />
+    <title>Чат</title>
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <!-- iOS не умеет svg в apple-touch-icon и подставит снимок экрана. -->
+    <link rel="apple-touch-icon" href="/icon.svg" />
+  </head>
+  <body>
+    <!-- Экран входа -->
+    <form id="join" class="join">
+      <h1>Чат</h1>
+      <label>
+        Ник
+        <input
+          id="nickname"
+          name="nickname"
+          autocomplete="nickname"
+          maxlength="20"
+          required
+          autofocus
+        />
+      </label>
+      <label>
+        Комната
+        <input
+          id="room"
+          name="room"
+          value="general"
+          maxlength="32"
+          pattern="[A-Za-z0-9_\-]+"
+          required
+        />
+      </label>
+      <button type="submit">Войти</button>
+      <p id="join-error" class="error" hidden></p>
+    </form>
+
+    <!-- Экран чата -->
+    <main id="chat" class="chat" hidden>
+      <header class="bar">
+        <span id="room-name" class="room"></span>
+        <span class="tools">
+          <button id="alerts" class="people" type="button" aria-pressed="false"
+                  aria-label="Уведомления об упоминаниях">🔔</button>
+          <button id="people" class="people" type="button" aria-expanded="false">
+            0 в комнате
+          </button>
+        </span>
+      </header>
+      <ul id="users" class="users" hidden></ul>
+      <p id="status" class="status" hidden></p>
+      <ol id="messages" class="messages" aria-live="polite"></ol>
+      <form id="composer" class="composer">
+        <button id="attach" class="attach" type="button" aria-label="Прикрепить картинку">
+          +
+        </button>
+        <input id="file" type="file" accept="image/*" hidden />
+        <button id="record" class="attach" type="button" aria-label="Записать голосовое">
+          ●
+        </button>
+        <input
+          id="text"
+          maxlength="1000"
+          autocomplete="off"
+          placeholder="Сообщение"
+        />
+        <button type="submit" aria-label="Отправить">→</button>
+      </form>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
