@@ -1,4 +1,4 @@
-//! Показ картинок в терминале.
+//! Картинки и файлы: показ в терминале и отправка на сервер.
 //!
 //! Рисуем полублоками: символ `▀` делит ячейку пополам, верхняя половина
 //! красится цветом символа, нижняя — цветом фона. Так одна строка терминала
@@ -8,9 +8,10 @@
 //! Протоколы вроде kitty или sixel дают настоящее разрешение, но живут в
 //! считаных терминалах и требуют аккуратной перерисовки при прокрутке.
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
-use image::{RgbImage, imageops::FilterType};
+use common::{Attachment, validate};
+use image::{ImageReader, Limits, RgbImage, imageops::FilterType};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -51,6 +52,66 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
     split_response(&response)
 }
 
+/// Отправляет файл на сервер и возвращает его описание.
+///
+/// Записать можно что угодно из поддерживаемых типов: картинку, чтобы её
+/// увидели в браузере, или готовое голосовое. Запись с микрофона из терминала
+/// не делается — по ssh микрофона всё равно нет, а тащить звуковой стек ради
+/// локального случая слишком дорого.
+pub fn upload(base: &str, path: &std::path::Path) -> Result<Attachment, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("не удалось прочитать файл: {err}"))?;
+    if bytes.len() > validate::MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "файл слишком большой: {} КБ при потолке {} КБ",
+            bytes.len() / 1024,
+            validate::MAX_UPLOAD_BYTES / 1024
+        ));
+    }
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "файл".to_string());
+    let Some(rest) = base.strip_prefix("http://") else {
+        return Err("отправка по https из терминала пока не поддерживается".into());
+    };
+    let authority = rest.trim_end_matches('/');
+
+    let mut stream = std::net::TcpStream::connect(authority)
+        .map_err(|err| format!("не удалось подключиться: {err}"))?;
+    let head = format!(
+        "POST /upload?name={} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        escape(&name),
+        bytes.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(&bytes))
+        .map_err(|err| format!("не удалось отправить файл: {err}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|err| format!("не удалось прочитать ответ: {err}"))?;
+
+    let body = split_response(&response)?;
+    serde_json::from_slice(&body).map_err(|err| format!("непонятный ответ сервера: {err}"))
+}
+
+/// Экранирует имя файла для строки запроса: в нём бывают пробелы и кириллица.
+fn escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(*byte as char);
+            }
+            _ => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
+}
+
 /// Отделяет тело от заголовков и проверяет код ответа.
 fn split_response(response: &[u8]) -> Result<Vec<u8>, String> {
     let separator = response
@@ -61,15 +122,53 @@ fn split_response(response: &[u8]) -> Result<Vec<u8>, String> {
     let head = String::from_utf8_lossy(&response[..separator]);
     let status = head.lines().next().unwrap_or_default();
     if !status.contains(" 200") {
-        // Файл мог быть вытеснен из хранилища сервера — это самый частый случай.
+        // Тело ответа сервер пишет по-человечески: «файл слишком большой»
+        // понятнее, чем «HTTP/1.1 413».
+        let body = String::from_utf8_lossy(&response[separator + 4..]);
+        let body = body.trim();
+        if !body.is_empty() && body.len() < 200 {
+            return Err(body.to_string());
+        }
         return Err(format!("сервер ответил: {}", status.trim()));
     }
 
     Ok(response[separator + 4..].to_vec())
 }
 
+/// Потолок стороны картинки. Снимок с любого телефона влезает с запасом.
+const MAX_SIDE: u32 = 12_000;
+
+/// Потолок памяти на разбор одной картинки.
+const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn decode(bytes: &[u8]) -> Result<RgbImage, String> {
-    image::load_from_memory(bytes)
+    // Пять мегабайт сжатого файла разворачиваются в гигабайты пикселей:
+    // одна такая «бомба» положила бы клиент по памяти, а это уже не падение
+    // окна, а убитый процесс без всякого сообщения.
+    decode_within(bytes, limits())
+}
+
+/// Ограничения на разбор.
+///
+/// Собираются по полям, а не литералом: `Limits` помечен `non_exhaustive`,
+/// и синтаксис обновления структуры к нему неприменим.
+#[allow(clippy::field_reassign_with_default)]
+fn limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    limits
+}
+
+fn decode_within(bytes: &[u8], limits: Limits) -> Result<RgbImage, String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| format!("не удалось определить формат: {err}"))?;
+    reader.limits(limits);
+
+    reader
+        .decode()
         .map(|image| image.to_rgb8())
         .map_err(|err| format!("не удалось разобрать картинку: {err}"))
 }
@@ -175,6 +274,37 @@ mod tests {
         assert_eq!(first.style.fg, Some(Color::Rgb(255, 128, 0)));
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbImage::from_pixel(width, height, image::Rgb([10, 20, 30]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn oversized_pictures_are_refused_before_they_are_decoded() {
+        let bytes = png_bytes(64, 64);
+
+        let mut tiny = Limits::default();
+        tiny.max_image_width = Some(8);
+        assert!(
+            decode_within(&bytes, tiny).is_err(),
+            "картинка прошла мимо лимита"
+        );
+        // Обычная картинка при этом разбирается как ни в чём не бывало.
+        assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn garbage_is_reported_not_panicked() {
+        let error = decode("это не картинка вовсе".as_bytes()).unwrap_err();
+
+        assert!(!error.is_empty());
+    }
+
     #[test]
     fn https_is_reported_as_unsupported() {
         let error = fetch("https://example/media/1").unwrap_err();
@@ -189,6 +319,33 @@ mod tests {
         let error = split_response(response).unwrap_err();
 
         assert!(error.contains("404"), "невнятная причина: {error}");
+    }
+
+    #[test]
+    fn server_explanation_wins_over_the_status_line() {
+        let response =
+            "HTTP/1.1 413 Payload Too Large\r\n\r\nфайл слишком большой: 9000 КБ".as_bytes();
+
+        let error = split_response(response).unwrap_err();
+
+        // «413» человеку ничего не говорит, а объяснение сервера — говорит.
+        assert!(error.contains("слишком большой"), "пришло: {error}");
+    }
+
+    #[test]
+    fn file_names_are_escaped_for_the_query() {
+        assert_eq!(escape("cat.png"), "cat.png");
+        // Пробелы и кириллица в имени не должны ломать строку запроса.
+        assert!(!escape("мой кот.png").contains(' '));
+        assert!(escape("мой кот.png").contains("%20"));
+    }
+
+    #[test]
+    fn missing_file_is_reported() {
+        let error =
+            upload("http://127.0.0.1:1", std::path::Path::new("нет-такого.png")).unwrap_err();
+
+        assert!(error.contains("прочитать"), "невнятная причина: {error}");
     }
 
     #[test]

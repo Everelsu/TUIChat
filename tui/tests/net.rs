@@ -101,7 +101,7 @@ async fn client_joins_and_exchanges_messages() {
     client.send(ClientMessage::Chat {
         text: "привет".into(),
         attachment: None,
-        reply: None,
+        reply_to: None,
     });
 
     let ServerMessage::Chat(message) = next_message(&mut incoming).await else {
@@ -127,7 +127,7 @@ async fn pong_is_swallowed_by_the_network_layer() {
     client.send(ClientMessage::Chat {
         text: "живой".into(),
         attachment: None,
-        reply: None,
+        reply_to: None,
     });
 
     // Интерфейс не должен видеть служебный обмен — сразу приходит чат.

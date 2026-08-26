@@ -5,6 +5,11 @@
 //! терминал, ни про сокет, поэтому проверяется обычными тестами.
 
 pub mod app;
+pub mod config;
+pub mod files;
+pub mod host;
+pub mod images;
 pub mod media;
 pub mod net;
+pub mod sound;
 pub mod ui;

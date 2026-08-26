@@ -995,3 +995,57 @@ async fn long_quote_is_trimmed() {
     // Цитата на весь экран мешала бы читать сам ответ.
     assert_eq!(excerpt.chars().count(), common::REPLY_EXCERPT_CHARS);
 }
+
+#[tokio::test]
+async fn typing_reaches_the_others_but_not_the_author() {
+    let url = spawn().await;
+    let mut alice = joined(&url, "alice", "general").await;
+    let mut bob = joined(&url, "bob", "general").await;
+    assert!(matches!(
+        recv(&mut alice).await,
+        ServerMessage::UserJoined { .. }
+    ));
+
+    send(&mut alice, &ClientMessage::Typing).await;
+
+    let ServerMessage::Typing { user } = recv(&mut bob).await else {
+        panic!("bob не увидел, что alice печатает");
+    };
+    assert_eq!(user.nickname, "alice");
+
+    // Себе «печатает» не приходит: первым ответом alice будет pong.
+    send(&mut alice, &ClientMessage::Ping).await;
+    assert!(matches!(recv(&mut alice).await, ServerMessage::Pong));
+}
+
+#[tokio::test]
+async fn typing_storm_is_throttled() {
+    let url = spawn().await;
+    let mut alice = joined(&url, "alice", "general").await;
+    let mut bob = joined(&url, "bob", "general").await;
+
+    // Клиент с ошибкой может слать это в цикле — до комнаты должно дойти
+    // не больше одного за секунду.
+    for _ in 0..20 {
+        send(&mut alice, &ClientMessage::Typing).await;
+    }
+    send(
+        &mut alice,
+        &ClientMessage::Chat {
+            text: "всё".into(),
+            attachment: None,
+            reply_to: None,
+        },
+    )
+    .await;
+
+    let mut typings = 0;
+    loop {
+        match recv(&mut bob).await {
+            ServerMessage::Typing { .. } => typings += 1,
+            ServerMessage::Chat(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(typings, 1, "лавина «печатает» прошла насквозь");
+}

@@ -269,6 +269,77 @@ button:active {
 
 .nick {
   margin-right: 6px;
+  cursor: pointer;
+}
+
+/* Цитата над ответом: видно, к чему он относится. */
+.quote {
+  display: block;
+  padding-left: 6px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+
+/* «печатает…» над полем ввода: точки бегут, чтобы строка читалась как живая. */
+.typing {
+  margin: 0;
+  padding: 4px 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.typing::after {
+  content: "";
+  animation: dots 1.2s steps(3, end) infinite;
+}
+
+@keyframes dots {
+  0% {
+    content: ".";
+  }
+  33% {
+    content: "..";
+  }
+  66% {
+    content: "...";
+  }
+}
+
+/* Кому анимация мешает — тот её и не увидит. */
+@media (prefers-reduced-motion: reduce) {
+  .typing::after {
+    animation: none;
+    content: "...";
+  }
+}
+
+/* Строка «отвечаю на …» над полем ввода. */
+.reply {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 13px;
+}
+
+.reply-text {
+  flex: 1;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply button {
+  width: 32px;
+  min-height: 32px;
+  border-color: var(--line);
+  color: var(--muted);
+  font-size: 16px;
 }
 
 .composer {

@@ -83,3 +83,39 @@ async fn missing_picture_is_reported_not_panicked() {
     // Файл мог быть вытеснен из хранилища — клиент обязан это пережить.
     assert!(error.contains("404"), "невнятная причина: {error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn picture_can_be_sent_from_the_terminal() {
+    let base = start_server().await;
+    let path = std::env::temp_dir().join(format!("chat-{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&path, png(32, 16)).unwrap();
+
+    let sent = path.clone();
+    let attachment = tokio::task::spawn_blocking(move || tui::media::upload(&base, &sent))
+        .await
+        .unwrap()
+        .expect("файл не загрузился");
+
+    assert_eq!(attachment.mime, "image/png");
+    assert_eq!(attachment.kind, common::AttachmentKind::Image);
+    // Имя доезжает целиком: по нему человек и узнаёт файл в переписке.
+    assert!(attachment.name.ends_with(".png"), "{}", attachment.name);
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_file_is_refused_with_a_readable_reason() {
+    let base = start_server().await;
+    let path = std::env::temp_dir().join(format!("chat-{}.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&path, vec![0u8; common::MAX_UPLOAD_BYTES + 1]).unwrap();
+
+    let sent = path.clone();
+    let error = tokio::task::spawn_blocking(move || tui::media::upload(&base, &sent))
+        .await
+        .unwrap()
+        .unwrap_err();
+
+    // Отказ должен объяснять причину, а не показывать код ответа.
+    assert!(error.contains("слишком большой"), "пришло: {error}");
+    std::fs::remove_file(&path).ok();
+}

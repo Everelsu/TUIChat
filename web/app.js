@@ -13,6 +13,9 @@ const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 /// Две минуты записи с запасом влезают в лимит загрузки, а заодно спасают от
 /// забытой включённой кнопки.
 const MAX_RECORD_MS = 120000;
+/// Как часто сообщаем, что печатаем, и сколько показываем чужое «печатает».
+const TYPING_EVERY = 2000;
+const TYPING_TTL = 4000;
 
 /// Ошибки, которые не лечатся переподключением: спрашиваем ник заново.
 const FATAL = new Set(["nickname_taken", "invalid_nickname", "invalid_room"]);
@@ -33,6 +36,10 @@ const ui = {
   alerts: el("alerts"),
   users: el("users"),
   status: el("status"),
+  typing: el("typing"),
+  reply: el("reply"),
+  replyText: el("reply-text"),
+  replyCancel: el("reply-cancel"),
   messages: el("messages"),
   composer: el("composer"),
   text: el("text"),
@@ -49,6 +56,11 @@ const state = {
   // накладывается на уже увиденное, и дубли надо отбрасывать.
   seen: new Set(),
   unread: 0,
+  /// Сообщение, на которое готовится ответ.
+  replyTo: null,
+  /// Кто печатает: id -> { nickname, at }.
+  typing: new Map(),
+  typingSent: 0,
   attempt: 0,
   closing: false,
   timers: { reconnect: null, ping: null, pong: null },
@@ -184,6 +196,13 @@ function handle(message) {
       showUsers();
       addSystem(`${message.user.nickname} вышел`);
       break;
+    case "typing":
+      state.typing.set(message.user.id, {
+        nickname: message.user.nickname,
+        at: Date.now(),
+      });
+      showTyping();
+      break;
     case "chat":
       addChat(message);
       break;
@@ -234,6 +253,8 @@ function mentionsMe(text) {
 }
 
 function addChat(message) {
+  // Раз пришло сообщение, печатать человек закончил.
+  if (state.typing.delete(message.from.id)) showTyping();
   // Уже показанную реплику пропускаем: так история после обрыва не двоится.
   if (state.seen.has(message.id)) return;
   state.seen.add(message.id);
@@ -256,11 +277,17 @@ function addChat(message) {
   // Угловые скобки — привычная запись из IRC и терминальных клиентов.
   nick.textContent = `<${message.from.nickname}>`;
   nick.style.color = nickColor(message.from.nickname);
+  // Ответ по клику именно на ник: клик по всему сообщению мешал бы выделять
+  // текст мышью.
+  nick.title = "Ответить";
+  nick.addEventListener("click", () => setReply(message));
 
   const text = document.createElement("span");
   // Только textContent: с innerHTML чужое сообщение стало бы разметкой.
   text.textContent = message.text;
 
+  // Цитата идёт первой строкой: сначала на что отвечают, потом что отвечают.
+  if (message.reply) item.append(quoteNode(message.reply));
   item.append(time, nick, text);
   if (message.attachment) item.append(attachmentNode(message.attachment));
   append(item);
@@ -268,6 +295,28 @@ function addChat(message) {
     countUnread();
     if (item.className === "mention") notifyMention(message);
   }
+}
+
+function quoteNode(reply) {
+  const quote = document.createElement("span");
+  quote.className = "quote";
+  quote.textContent = `${reply.nickname}: ${reply.excerpt}`;
+  return quote;
+}
+
+/// Взводит ответ: с сервером уйдёт только идентификатор, цитату он соберёт сам.
+function setReply(message) {
+  state.replyTo = message.id;
+  ui.reply.hidden = false;
+  const excerpt = message.text || message.attachment?.name || "";
+  ui.replyText.textContent = `↩ ${message.from.nickname}: ${excerpt}`;
+  ui.text.focus();
+}
+
+function clearReply() {
+  state.replyTo = null;
+  ui.reply.hidden = true;
+  ui.replyText.textContent = "";
 }
 
 function attachmentNode(attachment) {
@@ -329,8 +378,9 @@ async function uploadAndSend(file) {
     // Подпись берём из поля ввода: так картинка и комментарий к ней
     // оказываются одним сообщением, а не двумя.
     const text = ui.text.value.trim();
-    if (send({ type: "chat", text, attachment: attachment.id })) {
+    if (send({ type: "chat", text, attachment: attachment.id, reply_to: state.replyTo })) {
       ui.text.value = "";
+      clearReply();
     } else {
       addSystem("нет соединения, файл не отправлен", true);
     }
@@ -364,6 +414,35 @@ function showUsers() {
   }
 }
 
+/// Показывает, кто печатает. Сигнал одноразовый и гаснет сам — отдельного
+/// «я перестал печатать» в протоколе нет, и терять его нечего.
+function showTyping() {
+  const now = Date.now();
+  for (const [id, entry] of state.typing) {
+    if (now - entry.at > TYPING_TTL) state.typing.delete(id);
+  }
+
+  const names = [...state.typing.values()]
+    .map((entry) => entry.nickname)
+    .sort();
+  if (names.length === 0) {
+    ui.typing.hidden = true;
+    ui.typing.textContent = "";
+    return;
+  }
+
+  ui.typing.hidden = false;
+  ui.typing.textContent =
+    names.length === 1
+      ? `${names[0]} печатает`
+      : names.length === 2
+        ? `${names[0]} и ${names[1]} печатают`
+        : `${names.length} человек печатают`;
+}
+
+// Строка гаснет сама: без этого «печатает» висело бы, пока человек не напишет.
+setInterval(showTyping, 1000);
+
 function setStatus(text) {
   ui.status.hidden = text === null;
   ui.status.textContent = text || "";
@@ -382,6 +461,18 @@ document.addEventListener("visibilitychange", () => {
   state.unread = 0;
   document.title = "Чат";
 });
+
+ui.text.addEventListener("input", () => {
+  if (!state.joined || ui.text.value === "") return;
+  const now = Date.now();
+  // Реже, чем раз в две секунды, слать незачем: у получателя строка живёт
+  // дольше, а сервер лишние сообщения всё равно отбросит.
+  if (now - state.typingSent < TYPING_EVERY) return;
+  state.typingSent = now;
+  send({ type: "typing" });
+});
+
+ui.replyCancel.addEventListener("click", clearReply);
 
 ui.people.addEventListener("click", () => {
   const shown = !ui.users.hidden;
@@ -446,6 +537,7 @@ ui.join.addEventListener("submit", (event) => {
   ui.join.hidden = true;
   ui.chat.hidden = false;
   ui.messages.replaceChildren();
+  clearReply();
   ui.text.focus();
   connect();
 });
@@ -488,11 +580,13 @@ ui.composer.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = ui.text.value.trim();
   if (!text) return;
-  if (!send({ type: "chat", text })) {
+  if (!send({ type: "chat", text, reply_to: state.replyTo })) {
     addSystem("нет соединения, сообщение не отправлено", true);
     return;
   }
   ui.text.value = "";
+  state.typingSent = 0;
+  clearReply();
 });
 
 // Уходя со страницы, прощаемся явно: иначе остальные увидят наш уход

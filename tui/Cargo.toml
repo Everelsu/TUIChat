@@ -4,18 +4,23 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+server = { path = "../server" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 common.workspace = true
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 ratatui = "0.30.2"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 tokio-tungstenite = "0.30.0"
+toml = "1.1.4"
 unicode-width = "0.2.2"
 uuid.workspace = true
+axum = "0.8.9"
 
 [dev-dependencies]
 axum = "0.8.9"
-server = { path = "../server" }

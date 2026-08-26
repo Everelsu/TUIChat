@@ -113,6 +113,7 @@ impl NetHandle {
 
 /// Канал событий наружу, который умолкает, как только соединение объявлено
 /// устаревшим.
+#[derive(Clone)]
 struct Events {
     tx: UnboundedSender<Action>,
     alive: Arc<AtomicBool>,
@@ -131,8 +132,34 @@ pub fn spawn(config: NetConfig, actions: UnboundedSender<Action>) -> NetHandle {
         tx: actions,
         alive: Arc::clone(&alive),
     };
-    let task = tokio::spawn(run(config, events, rx));
+
+    let task = tokio::spawn(async move {
+        // Если задача упадёт, интерфейс без этой страховки останется вечно
+        // «подключаться»: событий больше не будет, и понять почему — никак.
+        let mut guard = DeathReport {
+            events: events.clone(),
+            armed: true,
+        };
+        run(config, events, rx).await;
+        guard.armed = false;
+    });
     NetHandle { tx, task, alive }
+}
+
+/// Докладывает наверх, если сетевая задача завершилась не по своей воле.
+struct DeathReport {
+    events: Events,
+    armed: bool,
+}
+
+impl Drop for DeathReport {
+    fn drop(&mut self) {
+        if self.armed {
+            self.events.send(NetEvent::Fatal {
+                reason: "сетевая задача упала, переподключение остановлено".to_string(),
+            });
+        }
+    }
 }
 
 enum Outcome {

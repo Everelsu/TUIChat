@@ -61,6 +61,13 @@ struct Files {
     bytes: usize,
 }
 
+/// Захват мьютекса, переживающий отравление: см. пояснение в `lib.rs`.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub struct MediaStore {
     capacity: usize,
     files: Mutex<Files>,
@@ -101,7 +108,7 @@ impl MediaStore {
             mime: mime.to_string(),
         };
 
-        let mut files = self.files.lock().expect("mutex отравлен");
+        let mut files = lock(&self.files);
         files.bytes += bytes.len();
         files.order.push_back(attachment.id);
         files.by_id.insert(
@@ -125,7 +132,7 @@ impl MediaStore {
     }
 
     pub fn get(&self, id: Uuid) -> Option<StoredFile> {
-        let files = self.files.lock().expect("mutex отравлен");
+        let files = lock(&self.files);
         files.by_id.get(&id).map(|entry| entry.file.clone())
     }
 
@@ -135,12 +142,12 @@ impl MediaStore {
     /// id, а имя, размер и тип берутся отсюда — подделать подпись под чужой
     /// картинкой нельзя.
     pub fn describe(&self, id: Uuid) -> Option<Attachment> {
-        let files = self.files.lock().expect("mutex отравлен");
+        let files = lock(&self.files);
         files.by_id.get(&id).map(|entry| entry.attachment.clone())
     }
 
     pub fn len(&self) -> usize {
-        self.files.lock().expect("mutex отравлен").by_id.len()
+        lock(&self.files).by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {

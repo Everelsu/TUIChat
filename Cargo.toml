@@ -11,3 +11,13 @@ common = { path = "common" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+# Тонкий LTO: полный даёт считаные проценты, а собирается втрое дольше.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# panic = "abort" сюда намеренно не добавлен: на раскрутке держится то, что
+# паника в рабочем потоке не убивает процесс, а превращается в сообщение
+# в переписке.

@@ -85,6 +85,9 @@ type Outbox = mpsc::UnboundedSender<ServerMessage>;
 struct Peer {
     user: UserInfo,
     outbox: Outbox,
+    /// Когда от этого участника последний раз приходило «печатаю».
+    /// Без учёта клиент с ошибкой залил бы комнату этими сообщениями.
+    last_typing: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
@@ -138,6 +141,18 @@ impl Room {
         self.peers
             .retain(|_, peer| peer.outbox.send(msg.clone()).is_ok());
     }
+}
+
+/// Захватывает мьютекс, переживая отравление.
+///
+/// Стандартный `lock().unwrap()` после паники в любой задаче под этим локом
+/// роняет каждое следующее обращение — сервер уходит в лавину падений и
+/// перестаёт принимать подключения. Для чата это неверный размен: данные
+/// внутри — просто список комнат, продолжать с ним безопаснее, чем умереть.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Все комнаты сервера.
@@ -200,7 +215,7 @@ impl Hub {
         user: UserInfo,
         outbox: Outbox,
     ) -> Result<Joined, (ErrorCode, String)> {
-        let mut rooms = self.rooms.lock().expect("mutex отравлен");
+        let mut rooms = lock(&self.rooms);
 
         match rooms.get(room_name) {
             Some(room) => {
@@ -237,13 +252,20 @@ impl Hub {
         room.broadcast(&ServerMessage::UserJoined { user: user.clone() });
         let others = room.peers.values().map(|peer| peer.user.clone()).collect();
         let history = room.history.iter().cloned().collect();
-        room.peers.insert(user.id, Peer { user, outbox });
+        room.peers.insert(
+            user.id,
+            Peer {
+                user,
+                outbox,
+                last_typing: None,
+            },
+        );
         Ok(Joined { others, history })
     }
 
     /// Убирает пользователя из комнаты и сообщает об этом остальным.
     fn leave(&self, room_name: &str, id: Uuid) {
-        let mut rooms = self.rooms.lock().expect("mutex отравлен");
+        let mut rooms = lock(&self.rooms);
         let Some(room) = rooms.get_mut(room_name) else {
             return;
         };
@@ -258,9 +280,39 @@ impl Hub {
         }
     }
 
+    /// Раздаёт «печатает» остальным в комнате.
+    ///
+    /// Слишком частые сообщения отбрасываются: показывать это чаще раза в
+    /// секунду всё равно нечего, а нагрузку клиент с ошибкой создать может.
+    fn typing(&self, room_name: &str, user: &UserInfo) {
+        const MIN_GAP: Duration = Duration::from_secs(1);
+
+        let mut rooms = lock(&self.rooms);
+        let Some(room) = rooms.get_mut(room_name) else {
+            return;
+        };
+        let Some(peer) = room.peers.get_mut(&user.id) else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        if peer
+            .last_typing
+            .is_some_and(|last| now.duration_since(last) < MIN_GAP)
+        {
+            return;
+        }
+        peer.last_typing = Some(now);
+
+        // Самому себе «печатает» не нужно.
+        let message = ServerMessage::Typing { user: user.clone() };
+        room.peers
+            .retain(|id, peer| *id == user.id || peer.outbox.send(message.clone()).is_ok());
+    }
+
     /// Кладёт реплику в комнату, доставая цитату из её же истории.
     fn post(&self, room_name: &str, mut message: ChatMessage, reply_to: Option<Uuid>) {
-        let mut rooms = self.rooms.lock().expect("mutex отравлен");
+        let mut rooms = lock(&self.rooms);
         if let Some(room) = rooms.get_mut(room_name) {
             // Цитату собираем на сервере: клиент присылает только id, иначе
             // ему ничего не стоило бы приписать чужие слова.
@@ -270,13 +322,11 @@ impl Hub {
     }
 
     pub fn room_count(&self) -> usize {
-        self.rooms.lock().expect("mutex отравлен").len()
+        lock(&self.rooms).len()
     }
 
     pub fn user_count(&self, room_name: &str) -> usize {
-        self.rooms
-            .lock()
-            .expect("mutex отравлен")
+        lock(&self.rooms)
             .get(room_name)
             .map_or(0, |room| room.peers.len())
     }
@@ -564,6 +614,8 @@ async fn join_phase(
         let (nickname, room) = match msg {
             ClientMessage::Join { nickname, room } => (nickname, room),
             ClientMessage::Leave => return None,
+            // До входа печатать некуда: комнаты ещё нет.
+            ClientMessage::Typing => continue,
             ClientMessage::Ping => {
                 send(sink, &ServerMessage::Pong).await.ok()?;
                 continue;
@@ -690,6 +742,7 @@ fn handle_text(state: &AppState, session: &Session, outbox: &Outbox, text: &str)
                 reply_to,
             );
         }
+        ClientMessage::Typing => state.hub.typing(&session.room, &session.user),
         ClientMessage::Ping => {
             let _ = outbox.send(ServerMessage::Pong);
         }

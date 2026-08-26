@@ -99,6 +99,10 @@ pub enum ClientMessage {
         reply_to: Option<Uuid>,
     },
     Leave,
+    /// «Я печатаю». Клиент шлёт не чаще раза в пару секунд, сервер раздаёт
+    /// остальным. Сообщение одноразовое: снимать его не нужно, у получателей
+    /// оно само гаснет.
+    Typing,
     Ping,
 }
 
@@ -123,6 +127,9 @@ pub enum ServerMessage {
         user: UserInfo,
     },
     Chat(ChatMessage),
+    Typing {
+        user: UserInfo,
+    },
     Error {
         code: ErrorCode,
         message: String,

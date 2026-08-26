@@ -4,13 +4,19 @@
 //! без ввода-вывода, поэтому поведение клиента проверяется юнит-тестами, а не
 //! глазами в терминале.
 
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use common::{
     Attachment, AttachmentKind, ChatMessage, ClientMessage, REPLY_EXCERPT_CHARS, ReplyPreview,
     ServerMessage, UserInfo, validate,
 };
 use image::RgbImage;
+use ratatui::style::Color;
+
+use crate::{config, files::FileEntry};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use uuid::Uuid;
 
@@ -26,11 +32,21 @@ const SCROLL_STEP: usize = 10;
 pub const HELP: &[&str] = &[
     "/join <комната> — перейти в другую комнату",
     "/nick <ник> — сменить ник",
-    "/view — показать последнюю картинку прямо в терминале",
-    "/open — открыть последнее вложение внешней программой",
+    "/send [путь] — отправить файл, без пути — выбрать",
+    "/view — показать картинку в терминале",
+    "/play, /stop — проиграть голосовое и остановить",
+    "/save [путь] — сохранить вложение на диск",
+    "/open — открыть вложение внешней программой",
+    "/color [ник] <цвет> — цвет ника, «-» сбрасывает",
     "/clear — очистить историю на экране",
     "/quit — выход",
-    "// в начале строки — отправить текст, начинающийся со слэша",
+    "//текст — отправить текст со слэша в начале",
+];
+
+/// Команды для дополнения по Tab. Порядок — как в справке.
+const COMMANDS: [&str; 13] = [
+    "/help", "/join", "/nick", "/send", "/view", "/play", "/stop", "/save", "/open", "/color",
+    "/clear", "/host", "/quit",
 ];
 
 /// Однострочное поле ввода: текст и позиция курсора.
@@ -145,6 +161,57 @@ pub enum NetEvent {
     },
 }
 
+/// Обзор файлов поверх переписки.
+#[derive(Debug)]
+pub struct Browser {
+    pub dir: std::path::PathBuf,
+    pub entries: Vec<FileEntry>,
+    pub selected: usize,
+    /// Отсев по имени: в каталоге на сотню файлов стрелками не находишься.
+    pub filter: Input,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl Browser {
+    /// Строки, оставшиеся после отсева.
+    pub fn visible(&self) -> Vec<&FileEntry> {
+        let needle = self.filter.text.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|entry| {
+                // «..» не прячем никогда: иначе из отфильтрованного каталога
+                // некуда деться.
+                entry.name == ".."
+                    || needle.is_empty()
+                    || entry.name.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    pub fn current(&self) -> Option<&FileEntry> {
+        self.visible().get(self.selected).copied()
+    }
+
+    fn move_by(&mut self, delta: i32) {
+        let count = self.visible().len();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let next = (self.selected as i32 + delta).clamp(0, count as i32 - 1);
+        self.selected = next as usize;
+    }
+}
+
+/// Миниатюра картинки, показываемой прямо в ленте.
+#[derive(Debug)]
+pub enum Thumbnail {
+    Loading,
+    Ready(Box<RgbImage>),
+    Failed,
+}
+
 /// Что показывает просмотрщик картинок поверх переписки.
 #[derive(Debug)]
 pub enum ViewerState {
@@ -155,19 +222,45 @@ pub enum ViewerState {
 
 #[derive(Debug)]
 pub struct Viewer {
+    /// Идентификатор вложения: по нему терминал понимает, что картинка та же
+    /// и перекодировать её заново не нужно.
+    pub id: Uuid,
     pub name: String,
     pub state: ViewerState,
 }
 
+/// Размер действия определяется самым большим вариантом — приветствием со
+/// списком участников и историей. Складывать его в Box смысла нет: по каналу
+/// проходит несколько сообщений в секунду, а лишняя аллокация была бы на
+/// каждое нажатие клавиши.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Action {
     Key(KeyEvent),
     Paste(String),
     Net(NetEvent),
-    /// Картинка скачана и разобрана — или не вышло.
-    Image(Result<Box<RgbImage>, String>),
+    /// Картинка скачана и разобрана — или не вышло. Идентификатор нужен,
+    /// чтобы понять, куда её класть: в просмотр или в ленту.
+    Image(Uuid, Result<Box<RgbImage>, String>),
+    /// Файл загружен на сервер — или не вышло.
+    Uploaded(Result<Attachment, String>),
+    /// Вложение сохранено на диск — или не вышло.
+    Saved(Result<std::path::PathBuf, String>),
+    /// Каталог прочитан — или не вышло.
+    Directory {
+        dir: std::path::PathBuf,
+        result: Result<Vec<FileEntry>, String>,
+    },
+    /// Голосовое скачано: байты уходят в звук, минуя состояние клиента.
+    Voice(Result<Vec<u8>, String>),
     /// Прокрутка колесом: вверх — положительное число строк.
     Scroll(i32),
+    /// Сообщение от самого клиента: сломался ввод, не записался конфиг и т.п.
+    Notice(String),
+    /// Спокойное сообщение от клиента: адрес для друга, ход дела.
+    Info(String),
+    /// Долгая работа закончилась: убрать бегунок.
+    Idle,
     /// Перерисовка по таймеру: нужна, чтобы тикал обратный отсчёт до реконнекта.
     Tick,
 }
@@ -226,6 +319,11 @@ pub enum SystemKind {
     Error,
 }
 
+/// Записи почти все — реплики, системные строки редки. Уносить содержимое
+/// реплики в Box значило бы аллокацию на каждое сообщение и разыменовку на
+/// каждой отрисовке ради экономии на редком варианте: при потолке в 2000
+/// записей речь идёт о полумегабайте.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Entry {
     Chat {
@@ -242,6 +340,9 @@ pub enum Entry {
         attachment: Option<Attachment>,
         /// Цитата сообщения, на которое отвечают.
         reply: Option<ReplyPreview>,
+        /// Когда реплика появилась на экране: по ней рисуется вспышка,
+        /// подсказывающая, что именно сейчас пришло.
+        arrived: Instant,
     },
     System {
         text: String,
@@ -261,9 +362,24 @@ pub enum Command {
     /// Открыть адрес системным просмотрщиком.
     Open(String),
     /// Скачать картинку, чтобы показать её в терминале.
-    Fetch(String),
+    Fetch(Uuid, String),
+    /// Отправить файл на сервер и приложить его к сообщению.
+    Upload(std::path::PathBuf),
+    /// Прочитать каталог для обзора файлов.
+    ReadDir(std::path::PathBuf),
+    /// Скачать и проиграть голосовое.
+    PlayVoice(String),
+    /// Остановить проигрывание.
+    StopVoice,
+    /// Скачать вложение и положить его на диск.
+    Save {
+        url: String,
+        destination: std::path::PathBuf,
+    },
     /// Звоночек терминала: единственное уведомление, доступное из TUI.
     Bell,
+    /// Записать настройки на диск: ник, комнату и цвета.
+    SaveConfig,
     Quit,
 }
 
@@ -326,6 +442,22 @@ pub struct State {
     pub room: String,
     /// http-адрес сервера: из него собираются ссылки на вложения.
     pub media_base: String,
+    /// Цвета ников, заданные человеком. Ключ — ник в нижнем регистре.
+    pub colors: HashMap<String, Color>,
+    /// Каталог, в котором последний раз выбирали файл.
+    pub last_dir: Option<String>,
+    /// Картинки, показываемые прямо в переписке. Ключ — идентификатор вложения.
+    pub thumbnails: HashMap<Uuid, Thumbnail>,
+    /// Что клиент делает прямо сейчас: качает, отправляет, сохраняет.
+    /// Пока не пусто, внизу крутится бегунок.
+    pub busy: Option<String>,
+    /// Умеет ли терминал настоящую графику. Полублоками миниатюра в несколько
+    /// строк превращается в цветной шум, поэтому там остаётся строка с именем.
+    pub inline_images: bool,
+    /// Кто сейчас печатает и когда об этом сказали в последний раз.
+    pub typing: HashMap<Uuid, (String, Instant)>,
+    /// Когда мы сами последний раз сообщили, что печатаем.
+    typing_sent: Option<Instant>,
     pub status: Status,
     pub me: Option<Uuid>,
     pub users: Vec<UserInfo>,
@@ -356,10 +488,37 @@ pub struct State {
     pub tick: u64,
     /// Открытая картинка поверх переписки.
     pub viewer: Option<Viewer>,
+    /// Открытый обзор файлов.
+    pub browser: Option<Browser>,
+    /// Открыта ли справка. Она тоже поверх: одиннадцать строк в ленте
+    /// выталкивают из виду сам разговор, ради которого её и открывали.
+    pub help: bool,
     pub should_quit: bool,
 }
 
+/// Сколько показываем «печатает», если новых сигналов не приходит.
+///
+/// Сигнал одноразовый: отменять его отдельным сообщением не нужно, он гаснет
+/// сам — так не приходится думать про потерянные «я перестал печатать».
+pub const TYPING_TTL: Duration = Duration::from_secs(4);
+
+/// Как часто сообщаем, что печатаем.
+const TYPING_EVERY: Duration = Duration::from_secs(2);
+
 impl State {
+    /// Кто печатает прямо сейчас, в алфавитном порядке.
+    pub fn typing_now(&self) -> Vec<&str> {
+        let now = Instant::now();
+        let mut names: Vec<&str> = self
+            .typing
+            .values()
+            .filter(|(_, at)| now.duration_since(*at) < TYPING_TTL)
+            .map(|(nickname, _)| nickname.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     /// Создаёт состояние. Если ник уже известен из аргументов, экран входа
     /// пропускается и клиент сразу подключается.
     pub fn new(nickname: Option<String>, room: String) -> (Self, Vec<Command>) {
@@ -373,6 +532,13 @@ impl State {
             nickname: String::new(),
             room: room.clone(),
             media_base: String::new(),
+            colors: HashMap::new(),
+            last_dir: None,
+            thumbnails: HashMap::new(),
+            busy: None,
+            inline_images: false,
+            typing: HashMap::new(),
+            typing_sent: None,
             status: Status::Connecting { attempt: 0 },
             me: None,
             users: Vec::new(),
@@ -391,6 +557,8 @@ impl State {
             viewport: Viewport::default(),
             tick: 0,
             viewer: None,
+            browser: None,
+            help: false,
             should_quit: false,
         };
 
@@ -429,6 +597,8 @@ impl State {
     /// Добавляет реплику, если её ещё не показывали.
     /// Возвращает `true`, если в ней упомянули нас.
     fn push_chat(&mut self, message: ChatMessage) -> bool {
+        // Раз пришло сообщение, печатать человек закончил.
+        self.typing.remove(&message.from.id);
         if !self.seen.insert(message.id) {
             return false;
         }
@@ -443,6 +613,7 @@ impl State {
             mentions_me,
             attachment: message.attachment,
             reply: message.reply,
+            arrived: Instant::now(),
         });
         mentions_me
     }
@@ -450,6 +621,7 @@ impl State {
     fn forget_room(&mut self) {
         self.entries.clear();
         self.seen.clear();
+        self.thumbnails.clear();
         self.users.clear();
         self.scrollback = 0;
     }
@@ -502,6 +674,93 @@ impl State {
     }
 }
 
+/// Сколько последних записей просматриваем в поисках картинок для ленты.
+///
+/// Дальше вверх человек редко уходит, а качать всю историю сразу — лишний
+/// трафик и лишняя память.
+const THUMBNAIL_LOOKBACK: usize = 30;
+
+/// Ставит в очередь скачивание картинок, которых ещё нет.
+fn queue_thumbnails(state: &mut State) -> Vec<Command> {
+    if !state.inline_images || state.media_base.is_empty() {
+        return Vec::new();
+    }
+
+    let wanted: Vec<Attachment> = state
+        .entries
+        .iter()
+        .rev()
+        .take(THUMBNAIL_LOOKBACK)
+        .filter_map(|entry| match entry {
+            Entry::Chat {
+                attachment: Some(attachment),
+                ..
+            } if attachment.kind == AttachmentKind::Image => Some(attachment.clone()),
+            _ => None,
+        })
+        .filter(|attachment| !state.thumbnails.contains_key(&attachment.id))
+        .collect();
+
+    wanted
+        .into_iter()
+        .map(|attachment| {
+            let url = format!("{}/media/{}", state.media_base, attachment.id);
+            state.thumbnails.insert(attachment.id, Thumbnail::Loading);
+            Command::Fetch(attachment.id, url)
+        })
+        .collect()
+}
+
+/// Приводит Ctrl с русской буквой к латинскому сочетанию.
+///
+/// При русской раскладке Ctrl+F физически приходит как «Ctrl+а», Ctrl+R — как
+/// «Ctrl+к», а Ctrl+C — как «Ctrl+с». То есть все сочетания отваливаются ровно
+/// тогда, когда ими и пользуются: когда человек пишет по-русски.
+fn normalize_shortcut(key: KeyEvent) -> KeyEvent {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    let KeyCode::Char(ch) = key.code else {
+        return key;
+    };
+
+    // Раскладка ЙЦУКЕН поверх QWERTY: буква на той же физической клавише.
+    let latin = match ch.to_lowercase().next().unwrap_or(ch) {
+        'й' => 'q',
+        'ц' => 'w',
+        'у' => 'e',
+        'к' => 'r',
+        'е' => 't',
+        'н' => 'y',
+        'г' => 'u',
+        'ш' => 'i',
+        'щ' => 'o',
+        'з' => 'p',
+        'ф' => 'a',
+        'ы' => 's',
+        'в' => 'd',
+        'а' => 'f',
+        'п' => 'g',
+        'р' => 'h',
+        'о' => 'j',
+        'л' => 'k',
+        'д' => 'l',
+        'я' => 'z',
+        'ч' => 'x',
+        'с' => 'c',
+        'м' => 'v',
+        'и' => 'b',
+        'т' => 'n',
+        'ь' => 'm',
+        _ => return key,
+    };
+
+    KeyEvent {
+        code: KeyCode::Char(latin),
+        ..key
+    }
+}
+
 /// Упомянут ли ник в тексте. Сравнение без учёта регистра — писать «Alice»
 /// и «alice» люди будут вперемешку.
 fn mentions(text: &str, nickname: &str) -> bool {
@@ -520,6 +779,7 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
             if key.kind != KeyEventKind::Press {
                 return Vec::new();
             }
+            let key = normalize_shortcut(key);
             match &mut state.screen {
                 Screen::Login(_) => on_login_key(state, key),
                 Screen::Chat => on_chat_key(state, key),
@@ -542,13 +802,94 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
             scroll_by(state, delta);
             Vec::new()
         }
+        Action::Notice(text) => {
+            state.busy = None;
+            state.system(SystemKind::Error, text);
+            Vec::new()
+        }
+        Action::Info(text) => {
+            state.system(SystemKind::Info, text);
+            Vec::new()
+        }
+        Action::Idle => {
+            state.busy = None;
+            Vec::new()
+        }
+        Action::Uploaded(Ok(attachment)) => {
+            state.busy = None;
+            state.system(SystemKind::Info, format!("отправляю {}", attachment.name));
+            // Подпись не запрашиваем: команда уже съела строку ввода, а
+            // писать её отдельным сообщением привычнее, чем в аргументах.
+            vec![Command::Send(ClientMessage::Chat {
+                text: String::new(),
+                attachment: Some(attachment.id),
+                reply_to: state.replying.take().map(|target| target.id),
+            })]
+        }
+        Action::Uploaded(Err(reason)) => {
+            state.busy = None;
+            state.system(SystemKind::Error, reason);
+            Vec::new()
+        }
+        Action::Directory { dir, result } => {
+            if let Some(browser) = &mut state.browser {
+                browser.loading = false;
+                browser.dir = dir;
+                browser.selected = 0;
+                browser.filter.clear();
+                match result {
+                    Ok(entries) => {
+                        browser.entries = entries;
+                        browser.error = None;
+                    }
+                    Err(reason) => {
+                        // Каталог мог исчезнуть или оказаться закрытым —
+                        // показываем причину, но обзор не закрываем.
+                        browser.entries.clear();
+                        browser.error = Some(reason);
+                    }
+                }
+            }
+            Vec::new()
+        }
+        Action::Saved(Ok(path)) => {
+            state.busy = None;
+            state.system(SystemKind::Info, format!("сохранено: {}", path.display()));
+            Vec::new()
+        }
+        Action::Saved(Err(reason)) => {
+            state.busy = None;
+            state.system(SystemKind::Error, reason);
+            Vec::new()
+        }
+        // Проигрывание — побочный эффект главного цикла: сюда действие
+        // доходит, только если звук не смог его перехватить.
+        Action::Voice(_) => Vec::new(),
         Action::Net(event) => on_net(state, event),
-        Action::Image(result) => {
-            if let Some(viewer) = &mut state.viewer {
-                viewer.state = match result {
-                    Ok(image) => ViewerState::Ready(image),
-                    Err(reason) => ViewerState::Failed(reason),
+        Action::Image(id, result) => {
+            // Бегунок снимаем, только если ждали именно эту картинку: фоновые
+            // миниатюры качаются молча и к нему отношения не имеют.
+            if state.viewer.as_ref().is_some_and(|viewer| viewer.id == id) {
+                state.busy = None;
+            }
+            // Одна и та же картинка может понадобиться и просмотру, и ленте:
+            // раскладываем по обоим местам, лишнего скачивания при этом нет.
+            if let Some(viewer) = &mut state.viewer
+                && viewer.id == id
+            {
+                viewer.state = match &result {
+                    Ok(image) => ViewerState::Ready(image.clone()),
+                    Err(reason) => ViewerState::Failed(reason.clone()),
                 };
+            }
+            if state.thumbnails.contains_key(&id) {
+                state.thumbnails.insert(
+                    id,
+                    match result {
+                        Ok(image) => Thumbnail::Ready(image),
+                        Err(_) => Thumbnail::Failed,
+                    },
+                );
             }
             Vec::new()
         }
@@ -646,8 +987,11 @@ fn scroll_by(state: &mut State, delta: i32) {
     state.scrollback = scrollback.clamp(0, state.viewport.max_scroll() as i64) as usize;
 }
 
-/// Дополняет ник по Tab, перебирая совпадения при повторных нажатиях.
-fn complete_nickname(state: &mut State) {
+/// Дополняет по Tab: в начале строки — команду, дальше — ник.
+///
+/// Команду в начале строки человек и ждёт: набирать её целиком, когда клиент
+/// и так знает список, — лишняя работа.
+fn complete(state: &mut State) {
     // Повторный Tab продолжает перебор, любая другая клавиша его сбрасывает:
     // иначе после правки строки перебор шёл бы по устаревшему слову.
     let (prefix, at) = match &state.completion {
@@ -753,6 +1097,71 @@ fn reveal_current_match(state: &mut State) {
     // до него, и то, что после.
     let end = (line + height / 2 + 1).clamp(height.min(total), total);
     state.scrollback = total.saturating_sub(end);
+}
+
+fn on_browser_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Esc || (ctrl && matches!(key.code, KeyCode::Char('c' | 'd'))) {
+        state.browser = None;
+        return Vec::new();
+    }
+
+    let Some(browser) = &mut state.browser else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Up => browser.move_by(-1),
+        KeyCode::Down => browser.move_by(1),
+        KeyCode::PageUp => browser.move_by(-10),
+        KeyCode::PageDown => browser.move_by(10),
+        // Влево — наверх по дереву. Backspace занят правкой отсева, но на
+        // пустом отсеве делает то же самое: так привычнее.
+        KeyCode::Left => return leave_dir(state),
+        KeyCode::Backspace if browser.filter.is_empty() => return leave_dir(state),
+        KeyCode::Enter => return choose(state),
+        _ => {
+            if edit_key(&mut browser.filter, key, validate::MAX_TEXT_CHARS) {
+                browser.selected = 0;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Поднимается на уровень выше.
+fn leave_dir(state: &mut State) -> Vec<Command> {
+    let Some(browser) = &mut state.browser else {
+        return Vec::new();
+    };
+    let Some(parent) = browser.dir.parent().map(std::path::Path::to_path_buf) else {
+        return Vec::new();
+    };
+    browser.loading = true;
+    vec![Command::ReadDir(parent)]
+}
+
+/// Открывает каталог или отправляет выбранный файл.
+fn choose(state: &mut State) -> Vec<Command> {
+    let Some(browser) = &state.browser else {
+        return Vec::new();
+    };
+    let Some(entry) = browser.current().cloned() else {
+        return Vec::new();
+    };
+
+    if entry.is_dir {
+        if let Some(browser) = &mut state.browser {
+            browser.loading = true;
+        }
+        return vec![Command::ReadDir(entry.path)];
+    }
+
+    let dir = browser.dir.clone();
+    state.browser = None;
+    state.last_dir = Some(dir.to_string_lossy().to_string());
+    state.busy = Some(format!("отправляю {}", entry.name));
+    // Каталог запоминаем: в следующий раз обзор откроется там же.
+    vec![Command::Upload(entry.path), Command::SaveConfig]
 }
 
 fn on_search_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
@@ -870,6 +1279,19 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         return Vec::new();
     }
 
+    if state.browser.is_some() {
+        return on_browser_key(state, key);
+    }
+
+    if state.help {
+        // Справку закрывает что угодно осмысленное: искать нужную клавишу,
+        // чтобы убрать подсказку, — отдельное издевательство.
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            state.help = false;
+        }
+        return Vec::new();
+    }
+
     if state.search.is_some() {
         return on_search_key(state, key);
     }
@@ -922,6 +1344,9 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
             toggle_picking(state);
             return Vec::new();
         }
+        // Отдельная клавиша для файла: набирать «/send» ради выбора картинки
+        // всё-таки лишний шаг.
+        KeyCode::Char('o') if ctrl => return send_command(state, ""),
         // Пока ответ взведён, Esc снимает его, а не выходит из программы.
         KeyCode::Esc if state.replying.is_some() => {
             state.replying = None;
@@ -940,12 +1365,32 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         KeyCode::Down => state.recall(1),
         KeyCode::PageUp => scroll_by(state, SCROLL_STEP as i32),
         KeyCode::PageDown => scroll_by(state, -(SCROLL_STEP as i32)),
-        KeyCode::Tab => complete_nickname(state),
+        KeyCode::Tab => complete(state),
         _ => {
-            edit_key(&mut state.input, key, validate::MAX_TEXT_CHARS);
+            let changed = edit_key(&mut state.input, key, validate::MAX_TEXT_CHARS);
+            if changed && !state.input.is_empty() {
+                return announce_typing(state);
+            }
         }
     }
     Vec::new()
+}
+
+/// Сообщает остальным, что мы печатаем, — но не чаще, чем нужно.
+fn announce_typing(state: &mut State) -> Vec<Command> {
+    if !state.is_online() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    if state
+        .typing_sent
+        .is_some_and(|last| now.duration_since(last) < TYPING_EVERY)
+    {
+        return Vec::new();
+    }
+
+    state.typing_sent = Some(now);
+    vec![Command::Send(ClientMessage::Typing)]
 }
 
 fn submit(state: &mut State) -> Vec<Command> {
@@ -978,6 +1423,7 @@ fn submit(state: &mut State) -> Vec<Command> {
 
     state.remember_sent(&line);
     state.input.clear();
+    state.typing_sent = None;
     // Отправлять файлы из терминала пока нельзя: показать результат он всё
     // равно не сможет, а загрузка без превью — сомнительное удобство.
     let reply_to = state.replying.take().map(|target| target.id);
@@ -995,9 +1441,7 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
 
     match name.as_str() {
         "help" | "?" => {
-            for line in HELP {
-                state.system(SystemKind::Info, *line);
-            }
+            state.help = true;
             Vec::new()
         }
         "quit" | "exit" => {
@@ -1007,11 +1451,17 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
         "clear" => {
             state.entries.clear();
             state.seen.clear();
+            state.thumbnails.clear();
             state.scrollback = 0;
             Vec::new()
         }
         "view" => view_command(state),
         "open" => open_command(state),
+        "send" => send_command(state, &arg),
+        "play" => play_command(state),
+        "stop" => vec![Command::StopVoice],
+        "save" => save_command(state, &arg),
+        "color" => color_command(state, &arg),
         "join" => join_command(state, &arg),
         "nick" => nick_command(state, &arg),
         other => {
@@ -1057,11 +1507,14 @@ fn view_command(state: &mut State) -> Vec<Command> {
         return Vec::new();
     };
 
+    let id = attachment.id;
+    state.busy = Some(format!("качаю {}", attachment.name));
     state.viewer = Some(Viewer {
+        id,
         name: attachment.name,
         state: ViewerState::Loading,
     });
-    vec![Command::Fetch(url)]
+    vec![Command::Fetch(id, url)]
 }
 
 /// Открывает последнее пришедшее вложение во внешней программе.
@@ -1080,6 +1533,137 @@ fn open_command(state: &mut State) -> Vec<Command> {
 
     state.system(SystemKind::Info, format!("открываю {}", attachment.name));
     vec![Command::Open(url)]
+}
+
+/// Проигрывает последнее голосовое.
+fn play_command(state: &mut State) -> Vec<Command> {
+    let Some(attachment) = last_attachment(state) else {
+        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+        return Vec::new();
+    };
+    if attachment.kind != AttachmentKind::Audio {
+        state.system(SystemKind::Error, "последнее вложение — не голосовое");
+        return Vec::new();
+    }
+    let Some(url) = attachment_url(state, &attachment) else {
+        state.system(SystemKind::Error, "неизвестен адрес сервера");
+        return Vec::new();
+    };
+
+    state.busy = Some(format!("качаю {}", attachment.name));
+    vec![Command::PlayVoice(url)]
+}
+
+/// Сохраняет последнее вложение на диск.
+fn save_command(state: &mut State, arg: &str) -> Vec<Command> {
+    let Some(attachment) = last_attachment(state) else {
+        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+        return Vec::new();
+    };
+    let Some(url) = attachment_url(state, &attachment) else {
+        state.system(SystemKind::Error, "неизвестен адрес сервера");
+        return Vec::new();
+    };
+
+    let arg = arg.trim().trim_matches(['"', '\'']).trim();
+    let destination = if arg.is_empty() {
+        downloads_dir().join(&attachment.name)
+    } else {
+        let path = std::path::PathBuf::from(arg);
+        // Указали каталог — дописываем имя файла сами.
+        if path.is_dir() {
+            path.join(&attachment.name)
+        } else {
+            path
+        }
+    };
+
+    state.busy = Some(format!("сохраняю {}", attachment.name));
+    vec![Command::Save { url, destination }]
+}
+
+/// Куда складывать файлы, если путь не указан.
+fn downloads_dir() -> std::path::PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        std::env::var_os("HOME")
+    };
+    match home.map(std::path::PathBuf::from) {
+        // «Загрузки» — то место, где такие файлы ищут в первую очередь.
+        Some(home) if home.join("Downloads").is_dir() => home.join("Downloads"),
+        Some(home) => home,
+        None => std::path::PathBuf::from("."),
+    }
+}
+
+/// Отправляет файл с диска.
+fn send_command(state: &mut State, arg: &str) -> Vec<Command> {
+    // Пути с пробелами люди берут в кавычки, а перетаскивание файла в окно
+    // терминала вставляет их само.
+    let path = arg.trim().trim_matches(['"', '\'']).trim();
+    if !state.is_online() {
+        state.system(SystemKind::Error, "нет соединения, файл не отправлен");
+        return Vec::new();
+    }
+    if state.media_base.is_empty() {
+        state.system(SystemKind::Error, "неизвестен адрес сервера");
+        return Vec::new();
+    }
+
+    // Без аргумента открываем обзор: набирать путь руками — ровно тот костыль,
+    // из-за которого отправка файла в терминале ощущается наказанием.
+    if path.is_empty() {
+        let dir = crate::files::start_dir(state.last_dir.as_deref());
+        state.browser = Some(Browser {
+            dir: dir.clone(),
+            entries: Vec::new(),
+            selected: 0,
+            filter: Input::default(),
+            loading: true,
+            error: None,
+        });
+        return vec![Command::ReadDir(dir)];
+    }
+
+    state.busy = Some(format!("отправляю {path}"));
+    vec![Command::Upload(std::path::PathBuf::from(path))]
+}
+
+/// Задаёт цвет ника: `/color <цвет>` для себя, `/color <ник> <цвет>` для чужого,
+/// `-` вместо цвета возвращает цвет по умолчанию.
+fn color_command(state: &mut State, arg: &str) -> Vec<Command> {
+    let mut parts = arg.split_whitespace();
+    let (nickname, value) = match (parts.next(), parts.next()) {
+        (Some(value), None) => (state.nickname.clone(), value.to_string()),
+        (Some(nickname), Some(value)) => (nickname.to_string(), value.to_string()),
+        _ => {
+            state.system(
+                SystemKind::Error,
+                "нужно так: /color #d97757 или /color bob cyan",
+            );
+            return Vec::new();
+        }
+    };
+
+    let key = validate::nickname_key(&nickname);
+    if value == "-" {
+        state.colors.remove(&key);
+        state.system(SystemKind::Info, format!("цвет {nickname} сброшен"));
+        return vec![Command::SaveConfig];
+    }
+
+    let Some(color) = config::parse_color(&value) else {
+        state.system(
+            SystemKind::Error,
+            format!("не понял цвет {value}: нужен #rrggbb или название вроде cyan"),
+        );
+        return Vec::new();
+    };
+
+    state.colors.insert(key, color);
+    state.system(SystemKind::Info, format!("цвет {nickname} теперь {value}"));
+    vec![Command::SaveConfig]
 }
 
 fn join_command(state: &mut State, arg: &str) -> Vec<Command> {
@@ -1197,6 +1781,9 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
                 );
                 state.system(SystemKind::Info, "/help — список команд");
             }
+            // Ник и комната запоминаются после удачного входа, а не при вводе:
+            // сохранять то, что сервер отверг, смысла нет.
+            commands.push(Command::SaveConfig);
         }
         ServerMessage::UserJoined { user } => {
             state.system(
@@ -1211,6 +1798,12 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
         ServerMessage::UserLeft { user } => {
             state.system(SystemKind::Leave, format!("{} вышел", user.nickname));
             state.users.retain(|known| known.id != user.id);
+            state.typing.remove(&user.id);
+        }
+        ServerMessage::Typing { user } => {
+            state
+                .typing
+                .insert(user.id, (user.nickname, Instant::now()));
         }
         ServerMessage::Chat(message) => {
             if state.push_chat(message) {
@@ -1223,6 +1816,7 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
         // Прикладной pong гасит сетевая задача, до состояния он не доходит.
         ServerMessage::Pong => {}
     }
+    commands.extend(queue_thumbnails(state));
     commands
 }
 
@@ -1528,12 +2122,29 @@ mod tests {
     #[test]
     fn slash_commands_do_not_reach_the_room() {
         let (mut state, _) = connected();
+        let before = state.entries.len();
         typed(&mut state, "/help");
 
         let commands = update(&mut state, key(KeyCode::Enter));
 
         assert!(commands.is_empty());
-        assert!(texts(&state).iter().any(|line| line.contains("/join")));
+        assert!(state.help, "справка не открылась");
+        // Справка поверх, а не в ленте: одиннадцать строк выталкивали бы
+        // из виду сам разговор, ради которого её и открывали.
+        assert_eq!(state.entries.len(), before);
+    }
+
+    #[test]
+    fn any_key_closes_the_help() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/help");
+        update(&mut state, key(KeyCode::Enter));
+
+        update(&mut state, key(KeyCode::Char('x')));
+
+        assert!(!state.help);
+        // Закрытие справки не должно попадать в поле ввода.
+        assert!(state.input.is_empty());
     }
 
     #[test]
@@ -1779,7 +2390,8 @@ mod tests {
     /// без неё поиску некуда прокручивать.
     fn with_history() -> State {
         let (mut state, _) = connected();
-        for text in ["первое сообщение", "второе про котов", "третье про котов"] {
+        for text in ["первое сообщение", "второе про котов", "третье про котов"]
+        {
             update(
                 &mut state,
                 Action::Net(NetEvent::Message(ServerMessage::Chat(chat_message(
@@ -1943,7 +2555,11 @@ mod tests {
         assert_eq!(state.search.as_ref().unwrap().current, 0);
 
         update(&mut state, key(KeyCode::Enter));
-        assert_eq!(state.search.as_ref().unwrap().current, 1, "перебор не замкнут");
+        assert_eq!(
+            state.search.as_ref().unwrap().current,
+            1,
+            "перебор не замкнут"
+        );
 
         update(&mut state, key(KeyCode::Up));
         assert_eq!(state.search.as_ref().unwrap().current, 0);
@@ -2003,6 +2619,726 @@ mod tests {
 
         assert!(state.input.is_empty());
         assert_eq!(state.search.as_ref().unwrap().query.text, "котов");
+    }
+
+    #[test]
+    fn color_command_sets_own_color() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/color #d97757");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(commands, [Command::SaveConfig]);
+        assert_eq!(
+            state.colors.get("alice"),
+            Some(&ratatui::style::Color::Rgb(217, 119, 87))
+        );
+    }
+
+    #[test]
+    fn color_command_sets_someone_elses_color() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/color Bob cyan");
+
+        update(&mut state, key(KeyCode::Enter));
+
+        // Ключ всегда в нижнем регистре: Bob и bob — один человек.
+        assert!(state.colors.contains_key("bob"));
+    }
+
+    #[test]
+    fn color_command_resets_with_a_dash() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/color bob cyan");
+        update(&mut state, key(KeyCode::Enter));
+
+        typed(&mut state, "/color bob -");
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(commands, [Command::SaveConfig]);
+        assert!(!state.colors.contains_key("bob"));
+    }
+
+    #[test]
+    fn nonsense_color_is_rejected_without_saving() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/color розовый в крапинку");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(commands.is_empty(), "испорченный цвет пошёл в настройки");
+        assert!(matches!(
+            state.entries.last(),
+            Some(Entry::System {
+                kind: SystemKind::Error,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn successful_join_asks_to_remember_the_nickname() {
+        let (mut state, _) = State::new(Some("alice".into()), "general".into());
+
+        let commands = update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Welcome {
+                your_id: Uuid::new_v4(),
+                room: "general".into(),
+                nickname: "alice".into(),
+                users: vec![],
+                history: vec![],
+            })),
+        );
+
+        // Запоминаем то, что сервер принял, а не то, что ввели.
+        assert!(commands.contains(&Command::SaveConfig));
+    }
+
+    #[test]
+    fn notice_shows_up_as_a_system_error() {
+        let (mut state, _) = connected();
+
+        update(&mut state, Action::Notice("клавиатура отвалилась".into()));
+
+        assert!(matches!(
+            state.entries.last(),
+            Some(Entry::System {
+                kind: SystemKind::Error,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn typing_is_announced_at_most_once_in_a_while() {
+        let (mut state, _) = connected();
+
+        let first = update(&mut state, key(KeyCode::Char('п')));
+        let second = update(&mut state, key(KeyCode::Char('р')));
+
+        assert_eq!(first, [Command::Send(ClientMessage::Typing)]);
+        // Второй символ подряд — не повод слать ещё раз.
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn typing_is_not_announced_while_offline() {
+        let (mut state, _) = State::new(Some("alice".into()), "general".into());
+
+        let commands = update(&mut state, key(KeyCode::Char('п')));
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn sending_resets_the_typing_timer() {
+        let (mut state, _) = connected();
+        update(&mut state, key(KeyCode::Char('п')));
+        typed(&mut state, "ривет");
+        update(&mut state, key(KeyCode::Enter));
+
+        // Новый набор — новая новость, ждать паузу заново незачем.
+        let commands = update(&mut state, key(KeyCode::Char('е')));
+
+        assert_eq!(commands, [Command::Send(ClientMessage::Typing)]);
+    }
+
+    #[test]
+    fn someone_typing_is_visible_until_it_expires() {
+        let (mut state, _) = connected();
+        let bob = user("bob");
+
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Typing {
+                user: bob.clone(),
+            })),
+        );
+        assert_eq!(state.typing_now(), ["bob"]);
+
+        // Сигнал одноразовый: «перестал печатать» никто не присылает, строка
+        // должна погаснуть сама.
+        state
+            .typing
+            .insert(bob.id, ("bob".into(), Instant::now() - TYPING_TTL));
+        assert!(state.typing_now().is_empty());
+    }
+
+    #[test]
+    fn a_message_stops_the_typing_line() {
+        let (mut state, _) = connected();
+        let bob = user("bob");
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Typing {
+                user: bob.clone(),
+            })),
+        );
+
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Chat(chat_message(
+                bob,
+                "привет",
+            )))),
+        );
+
+        assert!(state.typing_now().is_empty());
+    }
+
+    #[test]
+    fn leaving_stops_the_typing_line() {
+        let (mut state, _) = connected();
+        let bob = user("bob");
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Typing {
+                user: bob.clone(),
+            })),
+        );
+
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::UserLeft { user: bob })),
+        );
+
+        assert!(state.typing_now().is_empty());
+    }
+
+    fn picture_message(id: Uuid, kind: AttachmentKind) -> ServerMessage {
+        ServerMessage::Chat(ChatMessage {
+            id,
+            from: user("bob"),
+            text: String::new(),
+            ts: 1_700_000_000_000,
+            attachment: Some(Attachment {
+                id,
+                kind,
+                name: "кот.png".into(),
+                size: 1024,
+                mime: "image/png".into(),
+            }),
+            reply: None,
+        })
+    }
+
+    /// Клиент в терминале с настоящей графикой.
+    fn with_graphics() -> State {
+        let (mut state, _) = connected();
+        state.inline_images = true;
+        state.media_base = "http://127.0.0.1:8080".into();
+        state
+    }
+
+    #[test]
+    fn picture_in_the_feed_is_fetched_by_itself() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(11);
+
+        let commands = update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        assert!(commands.contains(&Command::Fetch(
+            id,
+            format!("http://127.0.0.1:8080/media/{id}")
+        )));
+        assert!(matches!(
+            state.thumbnails.get(&id),
+            Some(Thumbnail::Loading)
+        ));
+    }
+
+    #[test]
+    fn nothing_is_fetched_when_the_terminal_cannot_draw() {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        let id = Uuid::from_u128(12);
+
+        let commands = update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        // Полублоками миниатюра в десять строк — цветной шум, качать её незачем.
+        assert!(commands.is_empty());
+        assert!(state.thumbnails.is_empty());
+    }
+
+    #[test]
+    fn voice_messages_are_not_fetched_as_pictures() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(13);
+
+        let commands = update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Audio,
+            ))),
+        );
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn the_same_picture_is_fetched_once() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(14);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        // Та же картинка приходит второй раз — например, в истории комнаты
+        // после переподключения.
+        let again = update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn downloaded_picture_lands_in_the_feed() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(15);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        update(
+            &mut state,
+            Action::Image(id, Ok(Box::new(image::RgbImage::new(4, 4)))),
+        );
+
+        assert!(matches!(
+            state.thumbnails.get(&id),
+            Some(Thumbnail::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn a_broken_picture_is_remembered_as_broken() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(16);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+
+        update(&mut state, Action::Image(id, Err("404".into())));
+
+        // Иначе клиент качал бы её снова и снова на каждом новом сообщении.
+        assert!(matches!(state.thumbnails.get(&id), Some(Thumbnail::Failed)));
+    }
+
+    #[test]
+    fn one_download_serves_both_the_viewer_and_the_feed() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(17);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+        typed(&mut state, "/view");
+        update(&mut state, key(KeyCode::Enter));
+
+        update(
+            &mut state,
+            Action::Image(id, Ok(Box::new(image::RgbImage::new(4, 4)))),
+        );
+
+        assert!(matches!(
+            state.viewer.as_ref().map(|viewer| &viewer.state),
+            Some(ViewerState::Ready(_))
+        ));
+        assert!(matches!(
+            state.thumbnails.get(&id),
+            Some(Thumbnail::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn clearing_the_screen_forgets_the_pictures() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(18);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+        typed(&mut state, "/clear");
+
+        update(&mut state, key(KeyCode::Enter));
+
+        assert!(state.thumbnails.is_empty());
+    }
+
+    /// Комната с голосовым от bob.
+    fn with_voice() -> (State, Uuid) {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        let id = Uuid::from_u128(31);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(ServerMessage::Chat(ChatMessage {
+                id,
+                from: user("bob"),
+                text: String::new(),
+                ts: 1_700_000_000_000,
+                attachment: Some(Attachment {
+                    id,
+                    kind: AttachmentKind::Audio,
+                    name: "голосовое.webm".into(),
+                    size: 4096,
+                    mime: "audio/webm".into(),
+                }),
+                reply: None,
+            }))),
+        );
+        (state, id)
+    }
+
+    #[test]
+    fn play_command_downloads_the_last_voice() {
+        let (mut state, id) = with_voice();
+        typed(&mut state, "/play");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(
+            commands,
+            [Command::PlayVoice(format!(
+                "http://127.0.0.1:8080/media/{id}"
+            ))]
+        );
+    }
+
+    #[test]
+    fn play_command_refuses_a_picture() {
+        let mut state = with_graphics();
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                Uuid::from_u128(32),
+                AttachmentKind::Image,
+            ))),
+        );
+        typed(&mut state, "/play");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(commands.is_empty());
+        assert!(matches!(
+            state.entries.last(),
+            Some(Entry::System {
+                kind: SystemKind::Error,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stop_command_stops_playback() {
+        let (mut state, _) = with_voice();
+        typed(&mut state, "/stop");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(commands, [Command::StopVoice]);
+    }
+
+    #[test]
+    fn save_command_uses_the_attachment_name_by_default() {
+        let (mut state, _) = with_voice();
+        typed(&mut state, "/save");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        let [Command::Save { destination, .. }] = commands.as_slice() else {
+            panic!("сохранение не началось: {commands:?}");
+        };
+        // Имя берётся из вложения: придумывать своё — терять то, по которому
+        // файл потом искать.
+        assert_eq!(
+            destination.file_name().unwrap().to_string_lossy(),
+            "голосовое.webm"
+        );
+    }
+
+    #[test]
+    fn save_command_takes_an_explicit_path() {
+        let (mut state, _) = with_voice();
+        typed(&mut state, "/save C:\\звуки\\привет.webm");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        let [Command::Save { destination, .. }] = commands.as_slice() else {
+            panic!("сохранение не началось: {commands:?}");
+        };
+        assert!(destination.to_string_lossy().ends_with("привет.webm"));
+    }
+
+    #[test]
+    fn saving_reports_where_the_file_landed() {
+        let (mut state, _) = connected();
+
+        update(
+            &mut state,
+            Action::Saved(Ok(std::path::PathBuf::from("C:/загрузки/кот.png"))),
+        );
+
+        let Some(Entry::System { text, kind }) = state.entries.last() else {
+            panic!("нет сообщения о сохранении");
+        };
+        assert_eq!(*kind, SystemKind::Info);
+        assert!(text.contains("кот.png"), "{text}");
+    }
+
+    #[test]
+    fn long_work_shows_a_spinner_and_clears_it() {
+        let (mut state, _) = with_voice();
+        typed(&mut state, "/save");
+        update(&mut state, key(KeyCode::Enter));
+
+        assert!(state.busy.is_some(), "бегунок не появился");
+
+        update(
+            &mut state,
+            Action::Saved(Ok(std::path::PathBuf::from("кот.png"))),
+        );
+
+        assert!(state.busy.is_none(), "бегунок остался крутиться");
+    }
+
+    #[test]
+    fn background_thumbnails_do_not_touch_the_spinner() {
+        let mut state = with_graphics();
+        let id = Uuid::from_u128(41);
+        update(
+            &mut state,
+            Action::Net(NetEvent::Message(picture_message(
+                id,
+                AttachmentKind::Image,
+            ))),
+        );
+        state.busy = Some("сохраняю кот.png".into());
+
+        update(
+            &mut state,
+            Action::Image(id, Ok(Box::new(image::RgbImage::new(2, 2)))),
+        );
+
+        // Миниатюры качаются молча: снимать чужой бегунок они не должны.
+        assert_eq!(state.busy.as_deref(), Some("сохраняю кот.png"));
+    }
+
+    fn entry(name: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: std::path::PathBuf::from(format!("C:/фото/{name}")),
+            is_dir,
+            size: 1024,
+            supported: !is_dir,
+        }
+    }
+
+    /// Клиент с открытым обзором и прочитанным каталогом.
+    fn with_browser() -> State {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        typed(&mut state, "/send");
+        update(&mut state, key(KeyCode::Enter));
+        update(
+            &mut state,
+            Action::Directory {
+                dir: std::path::PathBuf::from("C:/фото"),
+                result: Ok(vec![
+                    entry("..", true),
+                    entry("вложенный", true),
+                    entry("кот.png", false),
+                    entry("пёс.png", false),
+                ]),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn send_without_a_path_opens_the_browser() {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        typed(&mut state, "/send");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        // Набирать путь руками — ровно тот костыль, ради которого обзор и есть.
+        assert!(state.browser.is_some());
+        assert!(matches!(commands.as_slice(), [Command::ReadDir(_)]));
+    }
+
+    #[test]
+    fn send_with_a_path_still_works_directly() {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        typed(&mut state, r"/send C:\фото\кот.png");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(state.browser.is_none());
+        assert!(matches!(commands.as_slice(), [Command::Upload(_)]));
+    }
+
+    #[test]
+    fn arrows_walk_the_listing() {
+        let mut state = with_browser();
+
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+
+        let browser = state.browser.as_ref().unwrap();
+        assert_eq!(browser.current().unwrap().name, "кот.png");
+    }
+
+    #[test]
+    fn enter_on_a_directory_reads_it() {
+        let mut state = with_browser();
+        update(&mut state, key(KeyCode::Down));
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(matches!(commands.as_slice(), [Command::ReadDir(_)]));
+        // Обзор не закрывается: мы всё ещё выбираем файл.
+        assert!(state.browser.is_some());
+    }
+
+    #[test]
+    fn enter_on_a_file_sends_it_and_remembers_the_directory() {
+        let mut state = with_browser();
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(state.browser.is_none(), "обзор не закрылся");
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Upload(_), Command::SaveConfig]
+        ));
+        // В следующий раз обзор откроется там же, где выбирали в прошлый.
+        assert_eq!(state.last_dir.as_deref(), Some("C:/фото"));
+        assert!(state.busy.is_some(), "бегунок не появился");
+    }
+
+    #[test]
+    fn typing_filters_the_listing() {
+        let mut state = with_browser();
+
+        typed(&mut state, "пёс");
+
+        let browser = state.browser.as_ref().unwrap();
+        let names: Vec<&str> = browser
+            .visible()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        // «..» остаётся всегда: иначе из отфильтрованного каталога некуда деться.
+        assert_eq!(names, ["..", "пёс.png"]);
+    }
+
+    #[test]
+    fn escape_closes_the_browser_without_quitting() {
+        let mut state = with_browser();
+
+        let commands = update(&mut state, key(KeyCode::Esc));
+
+        assert!(commands.is_empty());
+        assert!(state.browser.is_none());
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn unreadable_directory_keeps_the_browser_open() {
+        let mut state = with_browser();
+
+        update(
+            &mut state,
+            Action::Directory {
+                dir: std::path::PathBuf::from("C:/закрытый"),
+                result: Err("отказано в доступе".into()),
+            },
+        );
+
+        // Закрывать обзор из-за одного нечитаемого каталога незачем: человек
+        // просто вернётся назад.
+        let browser = state.browser.as_ref().expect("обзор закрылся");
+        assert!(browser.error.is_some());
+        assert!(!browser.loading);
+    }
+
+    #[test]
+    fn shortcuts_work_on_a_russian_layout() {
+        // Ctrl+F на русской раскладке физически приходит как «Ctrl+а».
+        let (mut state, _) = connected();
+        update(&mut state, ctrl('а'));
+        assert!(state.search.is_some(), "поиск не открылся по Ctrl+а");
+
+        let mut state = with_history();
+        update(&mut state, ctrl('к'));
+        assert!(state.picking.is_some(), "ответ не начался по Ctrl+к");
+
+        let (mut state, _) = connected();
+        let commands = update(&mut state, ctrl('с'));
+        assert_eq!(commands, [Command::Quit], "выход не сработал по Ctrl+с");
+    }
+
+    #[test]
+    fn russian_letters_still_type_normally() {
+        let (mut state, _) = connected();
+
+        typed(&mut state, "как дела");
+
+        // Подмена касается только сочетаний с Ctrl: обычный набор не трогаем.
+        assert_eq!(state.input.text, "как дела");
+    }
+
+    #[test]
+    fn editing_shortcuts_work_on_a_russian_layout() {
+        let (mut state, _) = connected();
+        typed(&mut state, "привет большой мир");
+
+        // Ctrl+W — это «Ctrl+ц».
+        update(&mut state, ctrl('ц'));
+
+        assert_eq!(state.input.text, "привет большой ");
     }
 
     #[test]

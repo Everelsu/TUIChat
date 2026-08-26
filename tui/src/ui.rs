@@ -12,13 +12,16 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, Paragraph},
 };
+use std::collections::HashMap;
+
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{
-        Entry, Field, Input, Login, Screen, Search, State, Status, SystemKind, Viewer, ViewerState,
-        Viewport,
+        Browser, Entry, Field, Input, Login, Screen, Search, State, Status, SystemKind, Thumbnail,
+        Viewer, ViewerState, Viewport,
     },
+    images::Images,
     media,
 };
 
@@ -57,21 +60,184 @@ const GROUP_WINDOW_MS: i64 = 120_000;
 /// Отступ содержимого от края экрана.
 const GUTTER: &str = " ";
 
-pub fn draw(frame: &mut Frame, state: &mut State) {
+/// Метка свежей реплики в левом поле.
+const FRESH_MARK: &str = "\u{258f}";
+
+/// Высота миниатюры в строках и её предельная ширина в колонках.
+///
+/// Лента должна оставаться лентой: картинка во весь экран вытесняет разговор,
+/// а разглядеть её целиком можно по `/view`.
+const THUMB_ROWS: u16 = 10;
+const THUMB_COLS: u16 = 46;
+
+/// Сколько живёт вспышка у нового сообщения.
+const FLASH: std::time::Duration = std::time::Duration::from_millis(900);
+
+pub fn draw(frame: &mut Frame, state: &mut State, images: &mut Images) {
     if let Screen::Login(login) = &state.screen {
         draw_login(frame, login, frame.area());
         return;
     }
 
-    draw_chat(frame, state);
+    draw_chat(frame, state, images);
     // Картинка рисуется поверх переписки: так не приходится пересчитывать
     // высоту сообщений и ломать прокрутку ради одного вложения.
     if let Some(viewer) = &state.viewer {
-        draw_viewer(frame, viewer, frame.area());
+        draw_viewer(frame, viewer, frame.area(), images);
+    }
+    if let Some(browser) = &state.browser {
+        draw_browser(frame, browser, frame.area());
+    }
+    if state.help {
+        draw_help(frame, frame.area());
     }
 }
 
-fn draw_chat(frame: &mut Frame, state: &mut State) {
+fn draw_browser(frame: &mut Frame, browser: &Browser, area: Rect) {
+    let area = centered(area, 74.min(area.width), 22.min(area.height));
+    frame.render_widget(Clear, area);
+
+    let title = shorten_left(
+        &browser.dir.to_string_lossy(),
+        area.width.saturating_sub(4) as usize,
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(format!(" {title} "))
+        .title_bottom(" enter выбрать · ← наверх · esc отмена ")
+        .border_style(Style::new().fg(palette::ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let [list_area, filter_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let visible = browser.visible();
+    let lines: Vec<Line> = if browser.loading {
+        vec![Line::from(Span::styled(
+            format!("{GUTTER}читаю…"),
+            Style::new().fg(palette::DIM),
+        ))]
+    } else if let Some(error) = &browser.error {
+        vec![Line::from(Span::styled(
+            format!("{GUTTER}{error}"),
+            Style::new().fg(palette::ERR),
+        ))]
+    } else if visible.is_empty() {
+        vec![Line::from(Span::styled(
+            format!("{GUTTER}ничего не нашлось"),
+            Style::new().fg(palette::DIM),
+        ))]
+    } else {
+        // Окно списка едет за выбором: без этого в длинном каталоге выбранное
+        // уезжает за край и стрелки перестают что-либо значить.
+        let height = list_area.height as usize;
+        let start = browser.selected.saturating_sub(height.saturating_sub(1));
+        visible
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(index, entry)| {
+                let chosen = index == browser.selected;
+                let color = if entry.is_dir {
+                    palette::ACCENT
+                } else if entry.supported {
+                    Color::Reset
+                } else {
+                    // Неподдерживаемое видно, но приглушено: прятать хуже —
+                    // человек пойдёт искать, куда делся его файл.
+                    palette::FAINT
+                };
+                let mut style = Style::new().fg(color);
+                if chosen {
+                    style = style.bg(palette::FAINT).fg(Color::Rgb(20, 20, 24));
+                }
+
+                let mark = if entry.is_dir { "▸ " } else { "  " };
+                let size = if entry.is_dir {
+                    String::new()
+                } else {
+                    human_size(entry.size)
+                };
+                let room = list_area.width as usize;
+                let name = format!("{GUTTER}{mark}{}", entry.name);
+                let pad = room.saturating_sub(name.width() + size.width() + 1);
+                Line::from(Span::styled(
+                    format!("{name}{}{size} ", " ".repeat(pad)),
+                    style,
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), list_area);
+
+    draw_field(frame, &browser.filter, filter_area, " отсев: ");
+}
+
+/// Обрезает длинный путь слева: конец пути важнее начала.
+fn shorten_left(text: &str, width: usize) -> String {
+    if text.width() <= width || width < 2 {
+        return text.to_string();
+    }
+    let mut tail = String::new();
+    for ch in text.chars().rev() {
+        if tail.width() + ch.width().unwrap_or(0) + 1 > width {
+            break;
+        }
+        tail.insert(0, ch);
+    }
+    format!("…{tail}")
+}
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let width = 72.min(area.width);
+    let height = (crate::app::HELP.len() as u16 + 6).min(area.height);
+    let area = centered(area, width, height);
+    frame.render_widget(Clear, area);
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" команды ")
+        .title_bottom(" любая клавиша — закрыть ")
+        .border_style(Style::new().fg(palette::ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = crate::app::HELP
+        .iter()
+        .map(|line| {
+            // Саму команду выделяем: глаз ищет в такой справке именно её.
+            match line.split_once(" — ") {
+                Some((command, what)) => Line::from(vec![
+                    Span::styled(
+                        // Пробел в конце обязателен: у длинной команды колонка
+                        // кончается, и описание слиплось бы с ней.
+                        format!("{GUTTER}{command:<28} "),
+                        Style::new().fg(palette::ACCENT),
+                    ),
+                    Span::styled(what.to_string(), Style::new().fg(palette::DIM)),
+                ]),
+                None => Line::from(Span::styled(
+                    format!("{GUTTER}{line}"),
+                    Style::new().fg(palette::DIM),
+                )),
+            }
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        format!("{GUTTER}tab ник · ctrl+r ответ · ctrl+f поиск · ↑ история"),
+        Style::new().fg(palette::FAINT),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_chat(frame: &mut Frame, state: &mut State, images: &mut Images) {
     // Строка с цитатой появляется, только когда ответ взведён: постоянно
     // держать под неё место жалко.
     let reply_height = u16::from(state.replying.is_some());
@@ -85,7 +251,7 @@ fn draw_chat(frame: &mut Frame, state: &mut State) {
     .areas(frame.area());
 
     draw_header(frame, state, header);
-    draw_messages(frame, state, messages);
+    draw_messages(frame, state, messages, images);
     draw_reply_bar(frame, state, reply);
     draw_input(frame, state, input);
     draw_hint(frame, state, hint);
@@ -103,7 +269,7 @@ fn draw_reply_bar(frame: &mut Frame, state: &State, area: Rect) {
         Span::styled(format!("{GUTTER} ↩ "), Style::new().fg(palette::ACCENT)),
         Span::styled(
             format!("{}: ", target.nickname),
-            Style::new().fg(nick_color(&target.nickname, false)),
+            Style::new().fg(nick_color(&state.colors, &target.nickname, false)),
         ),
         Span::styled(target.excerpt.clone(), Style::new().fg(palette::DIM)),
     ]);
@@ -174,13 +340,19 @@ fn status_span(state: &State) -> Span<'static> {
     }
 }
 
-fn draw_messages(frame: &mut Frame, state: &mut State, area: Rect) {
+fn draw_messages(frame: &mut Frame, state: &mut State, area: Rect, images: &mut Images) {
     let width = area.width.saturating_sub(2) as usize;
-    let (lines, offsets) = render_entries(
+    let Rendered {
+        lines,
+        offsets,
+        slots,
+    } = render_entries(
         &state.entries,
         width,
         state.search.as_ref(),
         state.picking,
+        &state.colors,
+        &state.thumbnails,
     );
     // Карта «запись -> строка» нужна поиску, чтобы прокрутить к найденному:
     // во сколько строк развернулось сообщение, известно только здесь.
@@ -201,9 +373,50 @@ fn draw_messages(frame: &mut Frame, state: &mut State, area: Rect) {
     // сообщения должны появляться прямо над полем ввода, а не улетать вверх.
     let mut visible: Vec<Line> =
         std::iter::repeat_n(Line::default(), height.saturating_sub(end - start)).collect();
+    let padding = height.saturating_sub(end - start);
     visible.extend_from_slice(&lines[start..end]);
 
     frame.render_widget(Paragraph::new(visible), area);
+    draw_thumbnails(frame, state, area, images, &slots, start, end, padding);
+}
+
+/// Кладёт картинки в зарезервированные под них строки.
+///
+/// Отдельным проходом, потому что картинка рисуется виджетом в прямоугольник,
+/// а не строкой текста: экранные координаты известны только после того, как
+/// стало понятно, какой кусок истории виден.
+#[allow(clippy::too_many_arguments)]
+fn draw_thumbnails(
+    frame: &mut Frame,
+    state: &State,
+    area: Rect,
+    images: &mut Images,
+    slots: &[Slot],
+    start: usize,
+    end: usize,
+    padding: usize,
+) {
+    for slot in slots {
+        // Верхний край картинки может уехать выше окна — тогда показываем
+        // столько, сколько осталось, а не прячем её целиком.
+        let visible_from = slot.line.max(start);
+        let bottom = (slot.line + THUMB_ROWS as usize).min(end);
+        if bottom <= visible_from {
+            continue;
+        }
+
+        let Some(Thumbnail::Ready(image)) = state.thumbnails.get(&slot.id) else {
+            continue;
+        };
+        let y = area.y + (padding + visible_from - start) as u16;
+        let rect = Rect {
+            x: area.x + 2,
+            y,
+            width: THUMB_COLS.min(area.width.saturating_sub(2)),
+            height: (bottom - visible_from) as u16,
+        };
+        images.render(frame, rect, slot.id, image);
+    }
 }
 
 fn draw_input(frame: &mut Frame, state: &State, area: Rect) {
@@ -251,6 +464,38 @@ fn draw_search(frame: &mut Frame, search: &Search, area: Rect) {
 }
 
 fn draw_hint(frame: &mut Frame, state: &State, area: Rect) {
+    // Своя работа важнее чужой: пока что-то качается, показываем именно это.
+    if let Some(busy) = &state.busy {
+        let frame_index = (state.tick as usize / 2) % SPINNER.len();
+        let line = Line::from(vec![
+            Span::raw(format!("{GUTTER} ")),
+            Span::styled(SPINNER[frame_index], Style::new().fg(palette::ACCENT)),
+            Span::styled(format!(" {busy}"), Style::new().fg(palette::DIM)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Пока кто-то печатает, подсказка уступает место живой информации:
+    // она всё равно повторяется от кадра к кадру, а это — новость.
+    let typing = state.typing_now();
+    if !typing.is_empty() && state.viewer.is_none() && state.search.is_none() {
+        // Точки бегут по тику — единственная анимация, которая тут уместна.
+        let dots = ".".repeat(1 + (state.tick as usize / 3) % 3);
+        let who = match typing.as_slice() {
+            [one] => format!("{one} печатает"),
+            [one, two] => format!("{one} и {two} печатают"),
+            many => format!("{} человек печатают", many.len()),
+        };
+        let line = Line::from(vec![
+            Span::raw(format!("{GUTTER} ")),
+            Span::styled(who, Style::new().fg(palette::DIM)),
+            Span::styled(dots, Style::new().fg(palette::ACCENT)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let hint = if state.viewer.is_some() {
         "esc закрыть картинку"
     } else if state.picking.is_some() {
@@ -358,7 +603,7 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
     frame.render_widget(Paragraph::new(footer), rows[5]);
 }
 
-fn draw_viewer(frame: &mut Frame, viewer: &Viewer, area: Rect) {
+fn draw_viewer(frame: &mut Frame, viewer: &Viewer, area: Rect, images: &mut Images) {
     let area = centered(
         area,
         area.width.saturating_sub(4),
@@ -371,11 +616,22 @@ fn draw_viewer(frame: &mut Frame, viewer: &Viewer, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(format!(" {} ", viewer.name))
-        .title_bottom(" esc — закрыть ")
+        // Заодно видно, чем рисуем: если вместо фотографии мозаика, сразу
+        // понятно, что терминал графику не поддержал.
+        .title_bottom(format!(" esc — закрыть · {} ", images.kind()))
         .border_style(Style::new().fg(palette::ACCENT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
+        return;
+    }
+
+    // Сначала пробуем настоящую графику терминала: kitty, iTerm2, sixel.
+    // Полублоки остаются запасным путём — они работают везде, но фотография
+    // в них узнаётся с трудом.
+    if let ViewerState::Ready(image) = &viewer.state
+        && images.render(frame, inner, viewer.id, image)
+    {
         return;
     }
 
@@ -411,7 +667,18 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn nick_color(nickname: &str, mine: bool) -> Color {
+/// Цвета ников, заданные человеком: ник в нижнем регистре -> цвет.
+type Colors = HashMap<String, Color>;
+
+/// Цвет ника: сначала выбор человека, иначе устойчивый цвет по хешу.
+fn nick_color(colors: &Colors, nickname: &str, mine: bool) -> Color {
+    if let Some(color) = colors.get(&nickname.to_lowercase()) {
+        return *color;
+    }
+    hashed_nick_color(nickname, mine)
+}
+
+fn hashed_nick_color(nickname: &str, mine: bool) -> Color {
     if mine {
         return palette::ACCENT;
     }
@@ -422,14 +689,30 @@ fn nick_color(nickname: &str, mine: bool) -> Color {
 }
 
 /// Возвращает строки и карту «номер записи -> номер её первой строки».
+/// Место под картинку в ленте: с какой строки и какое вложение.
+pub struct Slot {
+    pub line: usize,
+    pub id: uuid::Uuid,
+}
+
+struct Rendered {
+    lines: Vec<Line<'static>>,
+    offsets: Vec<usize>,
+    slots: Vec<Slot>,
+}
+
 fn render_entries(
     entries: &[Entry],
     width: usize,
     search: Option<&Search>,
     picking: Option<usize>,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+    colors: &Colors,
+    thumbnails: &HashMap<uuid::Uuid, Thumbnail>,
+) -> Rendered {
+    let now = std::time::Instant::now();
     let mut lines = Vec::new();
     let mut offsets = Vec::with_capacity(entries.len());
+    let mut slots = Vec::new();
     // Автор и время последней реплики: по ним решается, начинать ли новую
     // группу с подписью.
     let mut previous: Option<(&str, i64)> = None;
@@ -462,6 +745,7 @@ fn render_entries(
                 mentions_me,
                 attachment,
                 reply,
+                arrived,
                 ..
             } => {
                 let same_author = previous
@@ -476,7 +760,7 @@ fn render_entries(
                         Span::styled(
                             from.clone(),
                             Style::new()
-                                .fg(nick_color(from, *mine))
+                                .fg(nick_color(colors, from, *mine))
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -486,8 +770,18 @@ fn render_entries(
                     ]));
                 }
 
-                // Картинку показывает /view, а в ленте достаточно подписи:
-                // полный адрес рвётся переносом и становится бесполезным.
+                // Скачанную картинку показываем прямо здесь: под неё
+                // резервируются пустые строки, а сам рисунок ляжет туда
+                // поверх, когда станут известны экранные координаты.
+                let inline = attachment.as_ref().and_then(|attachment| {
+                    match thumbnails.get(&attachment.id) {
+                        Some(Thumbnail::Ready(_)) => Some(attachment.id),
+                        _ => None,
+                    }
+                });
+
+                // Подпись остаётся в любом случае: по ней видно имя и размер,
+                // а полный адрес в ленте рвался бы переносом.
                 let body = match attachment {
                     Some(attachment) => {
                         let label =
@@ -507,7 +801,7 @@ fn render_entries(
                 // Цитата над ответом: видно, к чему он относится, даже если
                 // исходное сообщение уехало далеко вверх.
                 if let Some(reply) = reply {
-                    let quote = format!("| {}: {}", reply.nickname, reply.excerpt);
+                    let quote = format!("▏ {}: {}", reply.nickname, reply.excerpt);
                     for chunk in wrap(&quote, width) {
                         lines.push(Line::from(vec![
                             Span::raw(format!("{GUTTER} ")),
@@ -520,7 +814,21 @@ fn render_entries(
                 } else {
                     Style::new()
                 };
-                push_wrapped(&mut lines, style, &body, width, highlight);
+                push_wrapped(
+                    &mut lines,
+                    style,
+                    &body,
+                    width,
+                    highlight,
+                    fade(*arrived, now),
+                );
+                if let Some(id) = inline {
+                    slots.push(Slot {
+                        line: lines.len(),
+                        id,
+                    });
+                    lines.extend(std::iter::repeat_n(Line::default(), THUMB_ROWS as usize));
+                }
                 previous = Some((from, *ts));
             }
             Entry::System { text, kind } => {
@@ -536,11 +844,41 @@ fn render_entries(
                     SystemKind::Join => Style::new().fg(palette::OK),
                     _ => Style::new().fg(palette::FAINT),
                 };
-                push_wrapped(&mut lines, style, &format!("· {text}"), width, highlight);
+                push_wrapped(
+                    &mut lines,
+                    style,
+                    &format!("· {text}"),
+                    width,
+                    highlight,
+                    None,
+                );
             }
         }
     }
-    (lines, offsets)
+    Rendered {
+        lines,
+        offsets,
+        slots,
+    }
+}
+
+/// Гаснущий цвет метки: чем свежее реплика, тем ярче.
+///
+/// Три ступени вместо плавного перехода: терминал всё равно перерисовывается
+/// по тику, а взгляд ловит именно появление метки, а не её оттенок.
+fn fade(arrived: std::time::Instant, now: std::time::Instant) -> Option<Color> {
+    let age = now.saturating_duration_since(arrived);
+    if age >= FLASH {
+        return None;
+    }
+    let third = FLASH / 3;
+    Some(if age < third {
+        palette::ACCENT
+    } else if age < third * 2 {
+        palette::DIM
+    } else {
+        palette::FAINT
+    })
 }
 
 /// Кладёт текст с переносом и отступом от края экрана.
@@ -550,16 +888,22 @@ fn push_wrapped(
     text: &str,
     width: usize,
     highlight: Option<Color>,
+    mark: Option<Color>,
 ) {
     let style = match highlight {
         Some(color) => style.bg(color).fg(Color::Rgb(20, 20, 24)),
         None => style,
     };
-    for chunk in wrap(text, width) {
-        lines.push(Line::from(vec![
-            Span::raw(format!("{GUTTER} ")),
-            Span::styled(chunk, style),
-        ]));
+    for (index, chunk) in wrap(text, width).into_iter().enumerate() {
+        // Метка стоит только у первой строки: у перенесённого продолжения ей
+        // делать нечего, это то же самое сообщение.
+        let gutter = match mark {
+            Some(color) if index == 0 => {
+                Span::styled(format!("{FRESH_MARK} "), Style::new().fg(color))
+            }
+            _ => Span::raw(format!("{GUTTER} ")),
+        };
+        lines.push(Line::from(vec![gutter, Span::styled(chunk, style)]));
     }
 }
 
@@ -657,6 +1001,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::app::{Action, NetEvent, update};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn wraps_on_word_boundaries() {
@@ -695,7 +1040,9 @@ mod tests {
 
     fn render(state: &mut State, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, state)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, state, &mut crate::images::Images::disabled()))
+            .unwrap();
         terminal.backend().to_string()
     }
 
@@ -842,6 +1189,7 @@ mod tests {
     fn viewer_covers_the_chat_while_loading() {
         let mut state = populated();
         state.viewer = Some(Viewer {
+            id: Uuid::nil(),
             name: "кот.png".into(),
             state: ViewerState::Loading,
         });
@@ -858,6 +1206,7 @@ mod tests {
     fn viewer_explains_a_failure() {
         let mut state = populated();
         state.viewer = Some(Viewer {
+            id: Uuid::nil(),
             name: "кот.png".into(),
             state: ViewerState::Failed("сервер ответил: HTTP/1.1 404 Not Found".into()),
         });
@@ -872,6 +1221,7 @@ mod tests {
         let mut state = populated();
         let image = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 30, 30]));
         state.viewer = Some(Viewer {
+            id: Uuid::nil(),
             name: "кот.png".into(),
             state: ViewerState::Ready(Box::new(image)),
         });
@@ -880,6 +1230,206 @@ mod tests {
 
         // Полублоки — единственный способ, работающий во всех терминалах.
         assert!(screen.contains('\u{2580}'), "{screen}");
+    }
+
+    /// Прогон отрисовки по всем состояниям и множеству размеров окна.
+    ///
+    /// Ловит ровно тот класс падений, из-за которого клиент «вылетает»:
+    /// вычитание с переполнением и выход за границы при узком окне.
+    #[test]
+    fn every_screen_survives_every_size() {
+        let sizes = [
+            (1, 1),
+            (2, 3),
+            (4, 2),
+            (7, 5),
+            (12, 4),
+            (20, 6),
+            (40, 10),
+            (80, 24),
+            (200, 60),
+        ];
+
+        for (width, height) in sizes {
+            // Экран входа, в том числе с ошибкой.
+            let (mut login, _) = State::new(None, "general".into());
+            render(&mut login, width, height);
+            update(
+                &mut login,
+                Action::Net(NetEvent::Fatal {
+                    reason: "ник занят".into(),
+                }),
+            );
+            render(&mut login, width, height);
+
+            // Переписка со всеми украшениями сразу.
+            let mut chat = populated();
+            chat.input = Input::new("длинная строка ввода, которая не влезает целиком");
+            render(&mut chat, width, height);
+
+            // Прокрутка вверх и вниз до упора.
+            chat.scrollback = usize::MAX / 2;
+            render(&mut chat, width, height);
+            chat.scrollback = 0;
+
+            // Поиск, выбор ответа и взведённая цитата.
+            update(
+                &mut chat,
+                Action::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            );
+            render(&mut chat, width, height);
+            update(
+                &mut chat,
+                Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            );
+            update(
+                &mut chat,
+                Action::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            );
+            render(&mut chat, width, height);
+            update(
+                &mut chat,
+                Action::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            );
+            render(&mut chat, width, height);
+
+            // Просмотр картинки во всех трёх состояниях.
+            for state in [
+                ViewerState::Loading,
+                ViewerState::Failed("сервер ответил: HTTP/1.1 404 Not Found".into()),
+                ViewerState::Ready(Box::new(image::RgbImage::from_pixel(
+                    40,
+                    30,
+                    image::Rgb([200, 30, 30]),
+                ))),
+            ] {
+                chat.viewer = Some(Viewer {
+                    id: Uuid::nil(),
+                    name: "кот.png".into(),
+                    state,
+                });
+                render(&mut chat, width, height);
+            }
+            chat.viewer = None;
+
+            // Справка и обзор файлов — тоже поверх переписки.
+            chat.help = true;
+            render(&mut chat, width, height);
+            chat.help = false;
+
+            chat.browser = Some(crate::app::Browser {
+                dir: std::path::PathBuf::from("C:/очень/длинный/путь/куда-то/вглубь"),
+                entries: vec![crate::files::FileEntry {
+                    name: "кот.png".into(),
+                    path: std::path::PathBuf::from("C:/кот.png"),
+                    is_dir: false,
+                    size: 1024,
+                    supported: true,
+                }],
+                selected: 0,
+                filter: Input::default(),
+                loading: false,
+                error: None,
+            });
+            render(&mut chat, width, height);
+            chat.browser = None;
+
+            // Обрыв связи: в шапке появляется обратный отсчёт.
+            update(
+                &mut chat,
+                Action::Net(NetEvent::Disconnected {
+                    reason: "обрыв".into(),
+                    retry_at: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                }),
+            );
+            render(&mut chat, width, height);
+        }
+    }
+
+    #[test]
+    fn feed_reserves_room_for_a_ready_picture() {
+        let id = Uuid::from_u128(21);
+        let entries = vec![Entry::Chat {
+            id,
+            from: "bob".into(),
+            text: String::new(),
+            ts: 1_700_000_000_000,
+            mine: false,
+            mentions_me: false,
+            attachment: Some(common::Attachment {
+                id,
+                kind: common::AttachmentKind::Image,
+                name: "кот.png".into(),
+                size: 1024,
+                mime: "image/png".into(),
+            }),
+            reply: None,
+            arrived: std::time::Instant::now(),
+        }];
+
+        let mut ready = HashMap::new();
+        ready.insert(id, Thumbnail::Ready(Box::new(image::RgbImage::new(4, 4))));
+        let with_picture = render_entries(&entries, 40, None, None, &HashMap::new(), &ready);
+
+        assert_eq!(with_picture.slots.len(), 1);
+        // Под картинку зарезервированы пустые строки: сам рисунок ложится
+        // туда поверх, когда становятся известны экранные координаты.
+        assert!(with_picture.lines.len() > THUMB_ROWS as usize);
+
+        // Пока картинка не скачана, места под неё не занимаем.
+        let mut loading = HashMap::new();
+        loading.insert(id, Thumbnail::Loading);
+        let without = render_entries(&entries, 40, None, None, &HashMap::new(), &loading);
+
+        assert!(without.slots.is_empty());
+        assert!(without.lines.len() < with_picture.lines.len());
+    }
+
+    #[test]
+    fn browser_shows_files_and_marks_the_unsupported() {
+        let mut state = populated();
+        state.browser = Some(Browser {
+            dir: std::path::PathBuf::from("C:/фото"),
+            entries: vec![
+                crate::files::FileEntry {
+                    name: "..".into(),
+                    path: std::path::PathBuf::from("C:/"),
+                    is_dir: true,
+                    size: 0,
+                    supported: false,
+                },
+                crate::files::FileEntry {
+                    name: "кот.png".into(),
+                    path: std::path::PathBuf::from("C:/фото/кот.png"),
+                    is_dir: false,
+                    size: 240 * 1024,
+                    supported: true,
+                },
+            ],
+            selected: 1,
+            filter: Input::default(),
+            loading: false,
+            error: None,
+        });
+
+        let screen = render(&mut state, 80, 24);
+
+        assert!(screen.contains("кот.png"), "{screen}");
+        assert!(screen.contains("240 КБ"), "{screen}");
+        assert!(screen.contains("отсев"), "{screen}");
+        assert!(screen.contains("enter выбрать"), "{screen}");
+    }
+
+    #[test]
+    fn long_path_is_cut_from_the_left() {
+        let short = shorten_left("C:/фото", 20);
+        let long = shorten_left("C:/очень/длинный/путь/куда-то/вглубь/фото", 20);
+
+        assert_eq!(short, "C:/фото");
+        // Конец пути важнее начала: по нему понятно, где ты.
+        assert!(long.starts_with('…'), "{long}");
+        assert!(long.ends_with("фото"), "{long}");
+        assert!(long.width() <= 20, "{long}");
     }
 
     #[test]
