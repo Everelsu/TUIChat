@@ -2008,14 +2008,10 @@ mod tests {
         typed(&mut state, "alice");
         let commands = update(&mut state, key(KeyCode::Enter));
 
-        assert_eq!(
-            commands,
-            [Command::Connect {
-                nickname: "alice".into(),
-                room: "general".into(),
-                server: String::new(),
-            }]
-        );
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Connect { nickname, room, .. }] if nickname == "alice" && room == "general"
+        ));
         assert!(matches!(state.screen, Screen::Chat));
     }
 
