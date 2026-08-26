@@ -69,11 +69,9 @@ pub const DEFAULT_SERVER: &str = "ws://127.0.0.1:8080/ws";
 /// Присылают обычно не полный адрес, а «192.168.1.5:8080» — и требовать
 /// дописывать `ws://` и `/ws` руками значит терять людей на ровном месте.
 pub fn normalize_server(value: &str) -> Result<String, String> {
-    let value = value.trim().trim_end_matches('/');
-    if value.is_empty() {
-        return Err("не указан адрес сервера".into());
-    }
-
+    // Схему отделяем до обрезки слэшей: иначе «ws://» превращается в «ws:»
+    // и разбирается как имя узла.
+    let value = value.trim();
     let (scheme, rest) = if let Some(rest) = value.strip_prefix("wss://") {
         ("wss", rest)
     } else if let Some(rest) = value.strip_prefix("ws://") {
@@ -86,6 +84,7 @@ pub fn normalize_server(value: &str) -> Result<String, String> {
         ("ws", value)
     };
 
+    let rest = rest.trim_end_matches('/');
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
         // Путь по умолчанию тот же, что у сервера.

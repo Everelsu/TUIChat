@@ -181,7 +181,9 @@ async fn run(
     state.media_base = net::media_base(&url);
     // Миниатюры прямо в ленте показываем только там, где терминал умеет
     // настоящую графику: полублоками картинка в десять строк — цветной шум.
-    state.inline_images = config.inline_images.unwrap_or_else(|| images.inline_friendly());
+    state.inline_images = config
+        .inline_images
+        .unwrap_or_else(|| images.inline_friendly());
     // Адрес для второго человека показываем прямо в переписке: иначе первое,
     // что он спросит, — «а куда подключаться».
     if let Some(hosted) = &hosted {

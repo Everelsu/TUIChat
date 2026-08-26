@@ -195,7 +195,7 @@ fn shorten_left(text: &str, width: usize) -> String {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 72.min(area.width);
-    let height = (crate::app::HELP.len() as u16 + 6).min(area.height);
+    let height = (crate::app::HELP.len() as u16 + 7).min(area.height);
     let area = centered(area, width, height);
     frame.render_widget(Clear, area);
 
@@ -230,7 +230,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        format!("{GUTTER}tab ник · ctrl+r ответ · ctrl+f поиск · ↑ история"),
+        format!("{GUTTER}tab ник и команда · ctrl+o файл · ctrl+r ответ · ctrl+f поиск"),
+        Style::new().fg(palette::FAINT),
+    )));
+    lines.push(Line::from(Span::styled(
+        // Перехват мыши нужен ради прокрутки колесом и ломает выделение.
+        // Об этом надо сказать: иначе выглядит как поломка.
+        format!("{GUTTER}выделять текст мышью — с зажатым shift"),
         Style::new().fg(palette::FAINT),
     )));
 
@@ -504,7 +510,7 @@ fn draw_hint(frame: &mut Frame, state: &State, area: Rect) {
     } else if state.search.is_some() {
         "enter и стрелки — следующее совпадение · esc закрыть поиск"
     } else {
-        "enter отправить · tab ник · ctrl+r ответ · ctrl+f поиск · esc выход"
+        "enter отправить · tab дополнить · ctrl+o файл · /help — остальное"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

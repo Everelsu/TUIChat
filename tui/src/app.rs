@@ -1085,13 +1085,24 @@ fn complete(state: &mut State) {
         return;
     }
 
-    let key = validate::nickname_key(&prefix);
-    let matches: Vec<String> = state
-        .users
-        .iter()
-        .filter(|user| validate::nickname_key(&user.nickname).starts_with(&key))
-        .map(|user| user.nickname.clone())
-        .collect();
+    // Слово со слэша в начале строки — это команда, а не ник.
+    let command = at == 0 && prefix.starts_with('/');
+    let matches: Vec<String> = if command {
+        let needle = prefix.to_lowercase();
+        COMMANDS
+            .iter()
+            .filter(|name| name.starts_with(&needle))
+            .map(|name| (*name).to_string())
+            .collect()
+    } else {
+        let key = validate::nickname_key(&prefix);
+        state
+            .users
+            .iter()
+            .filter(|user| validate::nickname_key(&user.nickname).starts_with(&key))
+            .map(|user| user.nickname.clone())
+            .collect()
+    };
     if matches.is_empty() {
         return;
     }
@@ -1100,8 +1111,9 @@ fn complete(state: &mut State) {
         .completion
         .as_ref()
         .map_or(0, |completion| (completion.index + 1) % matches.len());
-    // В начале строки к человеку принято обращаться через запятую.
-    let suffix = if at == 0 { ", " } else { " " };
+    // В начале строки к человеку обращаются через запятую, команде запятая
+    // ни к чему.
+    let suffix = if command || at > 0 { " " } else { ", " };
     let completed = format!("{}{suffix}", matches[index]);
 
     let head: String = state.input.text.chars().take(at).collect();
@@ -3459,6 +3471,108 @@ mod tests {
         // Стереть и набрать ник заново — лишняя работа: правится обычно
         // одна буква.
         assert_eq!(login.nickname.text, "крутолёт");
+    }
+
+    #[test]
+    fn pasted_address_lets_you_join_a_friend() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.set_server(crate::net::DEFAULT_SERVER.to_string());
+        typed(&mut state, "alice");
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, ctrl('u'));
+        // Ровно то, что присылают в мессенджере.
+        typed(&mut state, "192.168.1.5:8080");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Connect { server, .. }] if server == "ws://192.168.1.5:8080/ws"
+        ));
+    }
+
+    #[test]
+    fn broken_address_keeps_you_on_the_login_screen() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.set_server(crate::net::DEFAULT_SERVER.to_string());
+        typed(&mut state, "alice");
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, ctrl('u'));
+        typed(&mut state, "ws://");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(commands.is_empty());
+        let Screen::Login(login) = &state.screen else {
+            panic!("ожидался экран входа");
+        };
+        assert_eq!(login.field, Field::Server);
+        assert!(login.error.is_some());
+    }
+
+    #[test]
+    fn host_command_raises_a_server_and_reconnects() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/host");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+        assert_eq!(commands, [Command::Host(8080)]);
+        assert!(state.busy.is_some());
+
+        let commands = update(
+            &mut state,
+            Action::Hosted {
+                url: "ws://127.0.0.1:8080/ws".into(),
+                lines: vec!["друг подключается: 192.168.1.5:8080".into()],
+            },
+        );
+
+        // Приглашение видно в переписке, а клиент сразу входит к себе же.
+        assert!(
+            texts(&state)
+                .iter()
+                .any(|line| line.contains("192.168.1.5"))
+        );
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Connect { server, .. }] if server == "ws://127.0.0.1:8080/ws"
+        ));
+        assert!(state.busy.is_none());
+    }
+
+    #[test]
+    fn host_command_rejects_a_nonsense_port() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/host восемь тысяч");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(commands.is_empty());
+        assert!(state.busy.is_none());
+    }
+
+    #[test]
+    fn tab_completes_a_command() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/se");
+
+        update(&mut state, key(KeyCode::Tab));
+
+        // Набирать команду целиком, когда клиент знает список, — лишняя работа.
+        assert_eq!(state.input.text, "/send ");
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_file_browser() {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+
+        let commands = update(&mut state, ctrl('o'));
+
+        assert!(state.browser.is_some());
+        assert!(matches!(commands.as_slice(), [Command::ReadDir(_)]));
     }
 
     #[test]
