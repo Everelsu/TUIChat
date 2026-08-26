@@ -38,6 +38,7 @@ pub const HELP: &[&str] = &[
     "/save [путь] — сохранить вложение на диск",
     "/open — открыть вложение внешней программой",
     "/color [ник] <цвет> — цвет ника, «-» сбрасывает",
+    "/host [порт] — поднять свой сервер и позвать друга",
     "/clear — очистить историю на экране",
     "/quit — выход",
     "//текст — отправить текст со слэша в начале",
@@ -253,6 +254,11 @@ pub enum Action {
     },
     /// Голосовое скачано: байты уходят в звук, минуя состояние клиента.
     Voice(Result<Vec<u8>, String>),
+    /// Сервер поднят прямо здесь: адрес для себя и строки-приглашения.
+    Hosted {
+        url: String,
+        lines: Vec<String>,
+    },
     /// Прокрутка колесом: вверх — положительное число строк.
     Scroll(i32),
     /// Сообщение от самого клиента: сломался ввод, не записался конфиг и т.п.
@@ -277,6 +283,9 @@ pub enum Field {
     #[default]
     Nickname,
     Room,
+    /// Адрес сервера. Без него подключиться к чужому серверу можно было бы
+    /// только флагом при запуске — то есть никак, если клиент уже открыт.
+    Server,
 }
 
 /// Экран входа. Он же — место, куда клиент возвращается, если ник занят:
@@ -285,6 +294,7 @@ pub enum Field {
 pub struct Login {
     pub nickname: Input,
     pub room: Input,
+    pub server: Input,
     pub field: Field,
     pub error: Option<String>,
 }
@@ -294,6 +304,7 @@ impl Login {
         match self.field {
             Field::Nickname => &mut self.nickname,
             Field::Room => &mut self.room,
+            Field::Server => &mut self.server,
         }
     }
 
@@ -301,7 +312,19 @@ impl Login {
         match self.field {
             Field::Nickname => validate::MAX_NICKNAME_CHARS,
             Field::Room => validate::MAX_ROOM_CHARS,
+            Field::Server => validate::MAX_TEXT_CHARS,
         }
+    }
+
+    fn next_field(&mut self, back: bool) {
+        self.field = match (self.field, back) {
+            (Field::Nickname, false) => Field::Room,
+            (Field::Room, false) => Field::Server,
+            (Field::Server, false) => Field::Nickname,
+            (Field::Nickname, true) => Field::Server,
+            (Field::Room, true) => Field::Nickname,
+            (Field::Server, true) => Field::Room,
+        };
     }
 }
 
@@ -354,11 +377,14 @@ pub enum Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Send(ClientMessage),
-    /// Поднять соединение заново — при входе, смене комнаты или ника.
+    /// Поднять соединение заново — при входе, смене комнаты, ника или сервера.
     Connect {
         nickname: String,
         room: String,
+        server: String,
     },
+    /// Поднять сервер прямо в этом клиенте.
+    Host(u16),
     /// Открыть адрес системным просмотрщиком.
     Open(String),
     /// Скачать картинку, чтобы показать её в терминале.
@@ -440,6 +466,8 @@ pub struct State {
     pub screen: Screen,
     pub nickname: String,
     pub room: String,
+    /// Адрес сервера, к которому подключаемся.
+    pub server: String,
     /// http-адрес сервера: из него собираются ссылки на вложения.
     pub media_base: String,
     /// Цвета ников, заданные человеком. Ключ — ник в нижнем регистре.
@@ -526,11 +554,13 @@ impl State {
             screen: Screen::Login(Login {
                 nickname: Input::new(nickname.clone().unwrap_or_default()),
                 room: Input::new(room.clone()),
+                server: Input::default(),
                 field: Field::Nickname,
                 error: None,
             }),
             nickname: String::new(),
             room: room.clone(),
+            server: String::new(),
             media_base: String::new(),
             colors: HashMap::new(),
             last_dir: None,
@@ -566,10 +596,27 @@ impl State {
             Some(nickname) => {
                 state.nickname = nickname.clone();
                 state.screen = Screen::Chat;
-                (state, vec![Command::Connect { nickname, room }])
+                // Адрес подставит главный цикл: он знает и настройки,
+                // и аргументы командной строки.
+                (
+                    state,
+                    vec![Command::Connect {
+                        nickname,
+                        room,
+                        server: String::new(),
+                    }],
+                )
             }
             None => (state, Vec::new()),
         }
+    }
+
+    /// Задаёт адрес сервера — и в состоянии, и в поле экрана входа.
+    pub fn set_server(&mut self, url: String) {
+        if let Screen::Login(login) = &mut self.screen {
+            login.server = Input::new(url.clone());
+        }
+        self.server = url;
     }
 
     pub fn is_online(&self) -> bool {
@@ -815,6 +862,19 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
             state.busy = None;
             Vec::new()
         }
+        Action::Hosted { url, lines } => {
+            state.busy = None;
+            for line in lines {
+                state.system(SystemKind::Info, line);
+            }
+            state.server = url.clone();
+            // Подключаемся к самим себе: снаружи это выглядит как обычный вход.
+            vec![Command::Connect {
+                nickname: state.nickname.clone(),
+                room: state.room.clone(),
+                server: url,
+            }]
+        }
         Action::Uploaded(Ok(attachment)) => {
             state.busy = None;
             state.system(SystemKind::Info, format!("отправляю {}", attachment.name));
@@ -930,18 +990,8 @@ fn on_login_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
 
     match key.code {
         KeyCode::Enter => return login_submit(state),
-        KeyCode::Tab | KeyCode::Down => {
-            login.field = match login.field {
-                Field::Nickname => Field::Room,
-                Field::Room => Field::Nickname,
-            };
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            login.field = match login.field {
-                Field::Nickname => Field::Room,
-                Field::Room => Field::Nickname,
-            };
-        }
+        KeyCode::Tab | KeyCode::Down => login.next_field(false),
+        KeyCode::BackTab | KeyCode::Up => login.next_field(true),
         _ => {
             let limit = login.limit();
             edit_key(login.active(), key, limit);
@@ -974,11 +1024,38 @@ fn login_submit(state: &mut State) -> Vec<Command> {
         }
     };
 
+    let typed = login.server.text.trim().to_string();
+
+    // Пустое поле означает «оставить как есть»: адрес обычно уже известен
+    // из настроек, и переписывать его каждый раз незачем.
+    let raw = match (typed.is_empty(), state.server.is_empty()) {
+        (false, _) => typed,
+        (true, false) => state.server.clone(),
+        // Ни в поле, ни в настройках ничего нет — значит, сервер свой,
+        // на этой же машине. Отказывать здесь не за что.
+        (true, true) => crate::net::DEFAULT_SERVER.to_string(),
+    };
+    let server = match crate::net::normalize_server(&raw) {
+        Ok(server) => server,
+        Err(reason) => {
+            if let Screen::Login(login) = &mut state.screen {
+                login.field = Field::Server;
+                login.error = Some(reason);
+            }
+            return Vec::new();
+        }
+    };
+
     state.nickname = nickname.clone();
     state.room = room.clone();
+    state.server = server.clone();
     state.screen = Screen::Chat;
     state.forget_room();
-    vec![Command::Connect { nickname, room }]
+    vec![Command::Connect {
+        nickname,
+        room,
+        server,
+    }]
 }
 
 /// Прокручивает историю: положительное число строк — вверх, к прошлому.
@@ -1462,6 +1539,7 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
         "stop" => vec![Command::StopVoice],
         "save" => save_command(state, &arg),
         "color" => color_command(state, &arg),
+        "host" => host_command(state, &arg),
         "join" => join_command(state, &arg),
         "nick" => nick_command(state, &arg),
         other => {
@@ -1630,6 +1708,24 @@ fn send_command(state: &mut State, arg: &str) -> Vec<Command> {
     vec![Command::Upload(std::path::PathBuf::from(path))]
 }
 
+/// Поднимает сервер прямо здесь и подключается к нему.
+fn host_command(state: &mut State, arg: &str) -> Vec<Command> {
+    let port = if arg.trim().is_empty() {
+        8080
+    } else {
+        match arg.trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                state.system(SystemKind::Error, "порт — это число, например /host 9000");
+                return Vec::new();
+            }
+        }
+    };
+
+    state.busy = Some("поднимаю сервер".to_string());
+    vec![Command::Host(port)]
+}
+
 /// Задаёт цвет ника: `/color <цвет>` для себя, `/color <ник> <цвет>` для чужого,
 /// `-` вместо цвета возвращает цвет по умолчанию.
 fn color_command(state: &mut State, arg: &str) -> Vec<Command> {
@@ -1686,6 +1782,7 @@ fn join_command(state: &mut State, arg: &str) -> Vec<Command> {
     vec![Command::Connect {
         nickname: state.nickname.clone(),
         room,
+        server: state.server.clone(),
     }]
 }
 
@@ -1707,6 +1804,7 @@ fn nick_command(state: &mut State, arg: &str) -> Vec<Command> {
     vec![Command::Connect {
         nickname,
         room: state.room.clone(),
+        server: state.server.clone(),
     }]
 }
 
@@ -1728,6 +1826,7 @@ fn on_net(state: &mut State, event: NetEvent) -> Vec<Command> {
             state.screen = Screen::Login(Login {
                 nickname: Input::new(state.nickname.clone()),
                 room: Input::new(state.room.clone()),
+                server: Input::new(state.server.clone()),
                 field: Field::Nickname,
                 error: Some(reason),
             });
@@ -1894,7 +1993,8 @@ mod tests {
             commands,
             [Command::Connect {
                 nickname: "alice".into(),
-                room: "general".into()
+                room: "general".into(),
+                server: String::new(),
             }]
         );
     }
@@ -1912,7 +2012,8 @@ mod tests {
             commands,
             [Command::Connect {
                 nickname: "alice".into(),
-                room: "general".into()
+                room: "general".into(),
+                server: String::new(),
             }]
         );
         assert!(matches!(state.screen, Screen::Chat));
@@ -2195,7 +2296,8 @@ mod tests {
             commands,
             [Command::Connect {
                 nickname: "alice".into(),
-                room: "rust".into()
+                room: "rust".into(),
+                server: String::new(),
             }]
         );
         assert!(
@@ -2281,7 +2383,8 @@ mod tests {
             commands,
             [Command::Connect {
                 nickname: "bob".into(),
-                room: "general".into()
+                room: "general".into(),
+                server: String::new(),
             }]
         );
     }
@@ -3339,6 +3442,27 @@ mod tests {
         update(&mut state, ctrl('ц'));
 
         assert_eq!(state.input.text, "привет большой ");
+    }
+
+    #[test]
+    fn rejected_nickname_comes_back_into_the_field() {
+        let (mut state, _) = State::new(None, "general".into());
+        typed(&mut state, "крутолёт");
+        update(&mut state, key(KeyCode::Enter));
+
+        update(
+            &mut state,
+            Action::Net(NetEvent::Fatal {
+                reason: "ник крутолёт в этой комнате уже занят".into(),
+            }),
+        );
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("ожидался экран входа");
+        };
+        // Стереть и набрать ник заново — лишняя работа: правится обычно
+        // одна буква.
+        assert_eq!(login.nickname.text, "крутолёт");
     }
 
     #[test]

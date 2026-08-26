@@ -177,10 +177,11 @@ async fn run(
         .collect();
     // Ссылки на вложения выводятся из адреса сокета — отдельного параметра
     // для них не нужно.
+    state.set_server(url.clone());
     state.media_base = net::media_base(&url);
     // Миниатюры прямо в ленте показываем только там, где терминал умеет
     // настоящую графику: полублоками картинка в десять строк — цветной шум.
-    state.inline_images = images.has_graphics();
+    state.inline_images = config.inline_images.unwrap_or_else(|| images.inline_friendly());
     // Адрес для второго человека показываем прямо в переписке: иначе первое,
     // что он спросит, — «а куда подключаться».
     if let Some(hosted) = &hosted {
@@ -190,12 +191,13 @@ async fn run(
     }
 
     let mut network: Option<NetHandle> = None;
+    let mut url = url;
     apply(
         &mut network,
         &actions,
-        &url,
+        &mut url,
         &mut config,
-        &state,
+        &mut state,
         &mut sound,
         startup,
     );
@@ -230,9 +232,9 @@ async fn run(
         apply(
             &mut network,
             &actions,
-            &url,
+            &mut url,
             &mut config,
-            &state,
+            &mut state,
             &mut sound,
             commands,
         );
@@ -254,9 +256,9 @@ async fn run(
 fn apply(
     network: &mut Option<NetHandle>,
     actions: &UnboundedSender<Action>,
-    url: &str,
+    url: &mut String,
     config: &mut Config,
-    state: &State,
+    state: &mut State,
     sound: &mut Sound,
     commands: Vec<Command>,
 ) {
@@ -267,14 +269,26 @@ fn apply(
                     network.send(msg);
                 }
             }
-            Command::Connect { nickname, room } => {
+            Command::Host(port) => host_here(port, actions.clone()),
+            Command::Connect {
+                nickname,
+                room,
+                server,
+            } => {
+                // Адрес мог смениться: человек вставил чужой на экране входа
+                // или поднял свой сервер командой.
+                if !server.is_empty() && server != *url {
+                    *url = server;
+                    state.media_base = net::media_base(url);
+                    config.server = url.clone();
+                }
                 // Прошлое соединение прощается и умолкает: его запоздавшие
                 // события не должны всплыть уже в новой комнате.
                 if let Some(previous) = network.take() {
                     previous.close();
                 }
                 *network = Some(net::spawn(
-                    NetConfig::new(url, nickname, room),
+                    NetConfig::new(url.as_str(), nickname, room),
                     actions.clone(),
                 ));
             }
@@ -335,6 +349,25 @@ fn color_to_hex(color: ratatui::style::Color) -> String {
         ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         other => format!("{other:?}").to_lowercase(),
     }
+}
+
+/// Поднимает сервер прямо здесь и докладывает адрес для друга.
+fn host_here(port: u16, actions: UnboundedSender<Action>) {
+    tokio::spawn(async move {
+        match host::start(port).await {
+            Ok(hosted) => {
+                let _ = actions.send(Action::Hosted {
+                    url: hosted.url.clone(),
+                    lines: hosted.invitations(),
+                });
+            }
+            Err(err) => {
+                let _ = actions.send(Action::Notice(format!(
+                    "не удалось поднять сервер на порту {port}: {err}"
+                )));
+            }
+        }
+    });
 }
 
 /// Читает каталог в отдельном потоке.

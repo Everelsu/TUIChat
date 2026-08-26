@@ -397,23 +397,22 @@ fn draw_thumbnails(
     padding: usize,
 ) {
     for slot in slots {
-        // Верхний край картинки может уехать выше окна — тогда показываем
-        // столько, сколько осталось, а не прячем её целиком.
-        let visible_from = slot.line.max(start);
-        let bottom = (slot.line + THUMB_ROWS as usize).min(end);
-        if bottom <= visible_from {
+        // Рисуем только целиком поместившиеся: обрезанная картинка меняет
+        // высоту на каждый шаг прокрутки, а от этого она перекодируется
+        // заново каждый кадр — и лента начинает дёргаться.
+        let bottom = slot.line + THUMB_ROWS as usize;
+        if slot.line < start || bottom > end {
             continue;
         }
 
         let Some(Thumbnail::Ready(image)) = state.thumbnails.get(&slot.id) else {
             continue;
         };
-        let y = area.y + (padding + visible_from - start) as u16;
         let rect = Rect {
             x: area.x + 2,
-            y,
+            y: area.y + (padding + slot.line - start) as u16,
             width: THUMB_COLS.min(area.width.saturating_sub(2)),
-            height: (bottom - visible_from) as u16,
+            height: THUMB_ROWS,
         };
         images.render(frame, rect, slot.id, image);
     }
@@ -542,7 +541,7 @@ fn draw_field(frame: &mut Frame, input: &Input, area: Rect, prefix: &str) {
 }
 
 fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
-    let form = centered(area, 40, 9);
+    let form = centered(area, 52, 11);
     if form.height < 5 {
         return;
     }
@@ -553,6 +552,8 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
         Constraint::Length(1), // поле ника
         Constraint::Length(1), // подпись «комната»
         Constraint::Length(1), // поле комнаты
+        Constraint::Length(1), // подпись «сервер»
+        Constraint::Length(1), // поле сервера
         Constraint::Min(0),    // ошибка или подсказка
     ])
     .split(form);
@@ -569,38 +570,37 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
     );
     frame.render_widget(Paragraph::new(Span::styled("ник", label)), rows[1]);
     frame.render_widget(Paragraph::new(Span::styled("комната", label)), rows[3]);
+    frame.render_widget(
+        Paragraph::new(Span::styled("сервер — можно вставить адрес друга", label)),
+        rows[5],
+    );
 
-    // Активное поле помечено стрелкой — иначе непонятно, куда попадёт ввод.
-    let (nick_prefix, room_prefix) = match login.field {
-        Field::Nickname => ("> ", "  "),
-        Field::Room => ("  ", "> "),
-    };
-
-    match login.field {
-        Field::Nickname => {
-            frame.render_widget(
-                Paragraph::new(format!("{room_prefix}{}", login.room.text)),
-                rows[4],
-            );
-            draw_field(frame, &login.nickname, rows[2], nick_prefix);
-        }
-        Field::Room => {
-            frame.render_widget(
-                Paragraph::new(format!("{nick_prefix}{}", login.nickname.text)),
-                rows[2],
-            );
-            draw_field(frame, &login.room, rows[4], room_prefix);
+    // Активное поле помечено стрелкой, остальные просто нарисованы: курсор
+    // в терминале один, и он должен стоять там, куда попадёт ввод.
+    let fields = [
+        (Field::Nickname, &login.nickname, rows[2]),
+        (Field::Room, &login.room, rows[4]),
+        (Field::Server, &login.server, rows[6]),
+    ];
+    for (field, input, row) in fields {
+        if field == login.field {
+            draw_field(frame, input, row, "> ");
+        } else {
+            frame.render_widget(Paragraph::new(format!("  {}", input.text)), row);
         }
     }
 
-    if rows[5].height == 0 {
+    if rows[7].height == 0 {
         return;
     }
     let footer = match &login.error {
         Some(error) => Line::from(Span::styled(error.clone(), Style::new().fg(palette::ERR))),
-        None => Line::from(Span::styled("tab — поле · enter — войти", label)),
+        None => Line::from(Span::styled(
+            "tab — поле · enter — войти · пусто в «сервере» — свой",
+            label,
+        )),
     };
-    frame.render_widget(Paragraph::new(footer), rows[5]);
+    frame.render_widget(Paragraph::new(footer), rows[7]);
 }
 
 fn draw_viewer(frame: &mut Frame, viewer: &Viewer, area: Rect, images: &mut Images) {

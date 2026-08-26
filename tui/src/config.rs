@@ -25,6 +25,9 @@ pub struct Config {
     pub room: String,
     /// Каталог, в котором последний раз выбирали файл для отправки.
     pub last_dir: Option<String>,
+    /// Показывать ли картинки прямо в переписке. `None` — решает клиент по
+    /// возможностям терминала: в sixel лента от них заметно тормозит.
+    pub inline_images: Option<bool>,
     /// Цвета ников: ключ — ник в нижнем регистре, значение — `#rrggbb`
     /// или название вроде `cyan`.
     pub colors: BTreeMap<String, String>,
@@ -33,10 +36,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server: "ws://127.0.0.1:8080/ws".to_string(),
+            server: crate::net::DEFAULT_SERVER.to_string(),
             nickname: None,
             room: "general".to_string(),
             last_dir: None,
+            inline_images: None,
             colors: BTreeMap::new(),
         }
     }

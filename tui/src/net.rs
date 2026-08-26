@@ -61,6 +61,49 @@ impl NetConfig {
     }
 }
 
+/// Куда подключаемся, если не сказано иначе.
+pub const DEFAULT_SERVER: &str = "ws://127.0.0.1:8080/ws";
+
+/// Приводит к рабочему виду то, что человеку прислали.
+///
+/// Присылают обычно не полный адрес, а «192.168.1.5:8080» — и требовать
+/// дописывать `ws://` и `/ws` руками значит терять людей на ровном месте.
+pub fn normalize_server(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return Err("не указан адрес сервера".into());
+    }
+
+    let (scheme, rest) = if let Some(rest) = value.strip_prefix("wss://") {
+        ("wss", rest)
+    } else if let Some(rest) = value.strip_prefix("ws://") {
+        ("ws", rest)
+    } else if let Some(rest) = value.strip_prefix("https://") {
+        ("wss", rest)
+    } else if let Some(rest) = value.strip_prefix("http://") {
+        ("ws", rest)
+    } else {
+        ("ws", value)
+    };
+
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        // Путь по умолчанию тот же, что у сервера.
+        None => (rest, "/ws".to_string()),
+    };
+    if authority.is_empty() {
+        return Err("не указан адрес сервера".into());
+    }
+
+    // Порт по умолчанию — тот, на котором сервер поднимается сам.
+    let authority = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:8080")
+    };
+    Ok(format!("{scheme}://{authority}{path}"))
+}
+
 /// http-адрес сервера, выведенный из адреса WebSocket: по нему клиент строит
 /// ссылки на вложения, не спрашивая их отдельным параметром.
 pub fn media_base(ws_url: &str) -> String {
@@ -381,6 +424,30 @@ mod tests {
         let waits: Vec<_> = (0..8).map(|n| backoff(&config, n).as_secs()).collect();
 
         assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    #[test]
+    fn pasted_address_is_brought_to_a_working_form() {
+        // Ровно то, что присылают в мессенджере.
+        assert_eq!(
+            normalize_server("192.168.1.5:8080"),
+            Ok("ws://192.168.1.5:8080/ws".to_string())
+        );
+        // Уже полный адрес не трогаем.
+        assert_eq!(
+            normalize_server("ws://192.168.1.5:8080/ws"),
+            Ok("ws://192.168.1.5:8080/ws".to_string())
+        );
+        // Ссылка на веб-клиент тоже годится: человек скопировал из браузера.
+        assert_eq!(
+            normalize_server("http://192.168.1.5:8080"),
+            Ok("ws://192.168.1.5:8080/ws".to_string())
+        );
+        assert_eq!(
+            normalize_server("https://chat.example"),
+            Ok("wss://chat.example:8080/ws".to_string())
+        );
+        assert!(normalize_server("   ").is_err());
     }
 
     #[test]
