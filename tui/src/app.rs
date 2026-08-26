@@ -34,6 +34,7 @@ pub const HELP: &[&str] = &[
     "/nick <ник> — сменить ник",
     "/send [путь] — отправить файл, без пути — выбрать",
     "/view — показать картинку в терминале",
+    "/rec — записать голосовое, повторно — отправить",
     "/play, /stop — проиграть голосовое и остановить",
     "/save [путь] — сохранить вложение на диск",
     "/open — открыть вложение внешней программой",
@@ -45,9 +46,9 @@ pub const HELP: &[&str] = &[
 ];
 
 /// Команды для дополнения по Tab. Порядок — как в справке.
-const COMMANDS: [&str; 13] = [
+const COMMANDS: [&str; 14] = [
     "/help", "/join", "/nick", "/send", "/view", "/play", "/stop", "/save", "/open", "/color",
-    "/clear", "/host", "/quit",
+    "/clear", "/host", "/rec", "/quit",
 ];
 
 /// Однострочное поле ввода: текст и позиция курсора.
@@ -397,6 +398,8 @@ pub enum Command {
     PlayVoice(String),
     /// Остановить проигрывание.
     StopVoice,
+    /// Начать запись с микрофона или закончить её и отправить.
+    ToggleRecording,
     /// Скачать вложение и положить его на диск.
     Save {
         url: String,
@@ -1547,6 +1550,7 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
         "view" => view_command(state),
         "open" => open_command(state),
         "send" => send_command(state, &arg),
+        "rec" => vec![Command::ToggleRecording],
         "play" => play_command(state),
         "stop" => vec![Command::StopVoice],
         "save" => save_command(state, &arg),
@@ -3573,6 +3577,18 @@ mod tests {
 
         assert!(state.browser.is_some());
         assert!(matches!(commands.as_slice(), [Command::ReadDir(_)]));
+    }
+
+    #[test]
+    fn rec_command_toggles_recording() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/rec");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        // Одна команда на оба действия: во время записи всё равно ничего
+        // другого не делаешь, а помнить две — лишнее.
+        assert_eq!(commands, [Command::ToggleRecording]);
     }
 
     #[test]

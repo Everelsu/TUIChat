@@ -40,7 +40,7 @@ impl fmt::Display for MediaError {
             ),
             MediaError::UnsupportedType => write!(
                 f,
-                "поддерживаются картинки (jpeg, png, gif, webp) и звук (webm, ogg, mp4)"
+                "поддерживаются картинки (jpeg, png, gif, webp) и звук (webm, ogg, mp4, wav)"
             ),
         }
     }
@@ -180,6 +180,10 @@ fn sniff(bytes: &[u8]) -> Option<(&'static str, AttachmentKind)> {
         audio("audio/ogg")
     } else if bytes.len() > 12 && &bytes[4..8] == b"ftyp" {
         audio("audio/mp4")
+    // Так пишет терминальный клиент: opus ему не закодировать без
+    // C-библиотеки, а wav браузеры играют нативно.
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        audio("audio/wav")
     } else {
         None
     }
@@ -241,7 +245,15 @@ mod tests {
         let ogg = Bytes::from_static(b"OggS       ");
         let mp4 = Bytes::from_static(b"    ftypisom   ");
 
-        for (bytes, expected) in [(webm, "audio/webm"), (ogg, "audio/ogg"), (mp4, "audio/mp4")] {
+        // А так пишет терминальный клиент.
+        let wav = Bytes::from_static(b"RIFFxxxxWAVEfmt ");
+
+        for (bytes, expected) in [
+            (webm, "audio/webm"),
+            (ogg, "audio/ogg"),
+            (mp4, "audio/mp4"),
+            (wav, "audio/wav"),
+        ] {
             let attachment = store.put("голосовое", bytes).unwrap();
             assert_eq!(attachment.mime, expected);
             assert_eq!(attachment.kind, AttachmentKind::Audio);

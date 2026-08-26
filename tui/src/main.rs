@@ -241,6 +241,13 @@ async fn run(
             commands,
         );
 
+        if sound.is_recording() {
+            state.busy = Some(format!(
+                "запись {} с · /rec — отправить",
+                sound.recorded_seconds()
+            ));
+        }
+
         terminal.draw(|frame| ui::draw(frame, &mut state, &mut images))?;
         // Выходим после отрисовки: человек должен успеть увидеть последний кадр.
         if state.should_quit {
@@ -300,6 +307,7 @@ fn apply(
             Command::ReadDir(path) => read_dir(path, actions.clone()),
             Command::PlayVoice(url) => fetch_voice(url, actions.clone()),
             Command::StopVoice => sound.stop_voice(),
+            Command::ToggleRecording => toggle_recording(sound, state, actions.clone()),
             Command::Save { url, destination } => save_file(url, destination, actions.clone()),
             // Звоночек — единственное уведомление, доступное из терминала:
             // системных всплывашек у нас нет.
@@ -351,6 +359,42 @@ fn color_to_hex(color: ratatui::style::Color) -> String {
         ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         other => format!("{other:?}").to_lowercase(),
     }
+}
+
+/// Начинает запись или заканчивает её и отправляет.
+///
+/// Одна команда на оба действия: во время записи всё равно ничего другого
+/// не делаешь, а помнить две — лишнее.
+fn toggle_recording(sound: &mut Sound, state: &mut State, actions: UnboundedSender<Action>) {
+    if !sound.is_recording() {
+        match sound.start_recording() {
+            Ok(()) => state.busy = Some("запись · /rec — отправить".to_string()),
+            Err(reason) => {
+                let _ = actions.send(Action::Notice(reason));
+            }
+        }
+        return;
+    }
+
+    let bytes = match sound.stop_recording() {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            state.busy = None;
+            let _ = actions.send(Action::Notice(reason));
+            return;
+        }
+    };
+    state.busy = Some("отправляю голосовое".to_string());
+
+    let base = state.media_base.clone();
+    tokio::spawn(async move {
+        let work =
+            tokio::task::spawn_blocking(move || media::upload_bytes(&base, "голосовое.wav", bytes));
+        let result = work
+            .await
+            .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")));
+        let _ = actions.send(Action::Uploaded(result));
+    });
 }
 
 /// Поднимает сервер прямо здесь и докладывает адрес для друга.

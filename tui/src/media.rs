@@ -54,12 +54,19 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
 
 /// Отправляет файл на сервер и возвращает его описание.
 ///
-/// Записать можно что угодно из поддерживаемых типов: картинку, чтобы её
-/// увидели в браузере, или готовое голосовое. Запись с микрофона из терминала
-/// не делается — по ssh микрофона всё равно нет, а тащить звуковой стек ради
-/// локального случая слишком дорого.
+/// Годится и картинка, и голосовое — как готовое с диска, так и только что
+/// записанное с микрофона.
 pub fn upload(base: &str, path: &std::path::Path) -> Result<Attachment, String> {
     let bytes = std::fs::read(path).map_err(|err| format!("не удалось прочитать файл: {err}"))?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "файл".to_string());
+    upload_bytes(base, &name, bytes)
+}
+
+/// То же самое, но для того, что и так уже в памяти: записанного голосового.
+pub fn upload_bytes(base: &str, name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     if bytes.len() > validate::MAX_UPLOAD_BYTES {
         return Err(format!(
             "файл слишком большой: {} КБ при потолке {} КБ",
@@ -68,10 +75,6 @@ pub fn upload(base: &str, path: &std::path::Path) -> Result<Attachment, String> 
         ));
     }
 
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "файл".to_string());
     let Some(rest) = base.strip_prefix("http://") else {
         return Err("отправка по https из терминала пока не поддерживается".into());
     };
@@ -81,7 +84,7 @@ pub fn upload(base: &str, path: &std::path::Path) -> Result<Attachment, String> 
         .map_err(|err| format!("не удалось подключиться: {err}"))?;
     let head = format!(
         "POST /upload?name={} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        escape(&name),
+        escape(name),
         bytes.len()
     );
     stream
