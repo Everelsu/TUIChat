@@ -648,7 +648,10 @@ fn draw_login_rooms(frame: &mut Frame, login: &Login, header: Rect, body: Rect) 
             .clone()
             .unwrap_or_else(|| "нажмите ctrl+r, чтобы обновить".to_string());
         frame.render_widget(
-            Paragraph::new(Span::styled(format!("  {note}"), Style::new().fg(palette::DIM))),
+            Paragraph::new(Span::styled(
+                format!("  {note}"),
+                Style::new().fg(palette::DIM),
+            )),
             body,
         );
         return;

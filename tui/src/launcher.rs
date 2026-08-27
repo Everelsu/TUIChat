@@ -284,29 +284,102 @@ mod tests {
         assert_eq!(Mode::parse("иногда"), None);
     }
 
+    /// Двойной клик по программе в Windows: ровно тот случай, ради которого
+    /// всё и затевалось.
+    fn double_click() -> Situation {
+        Situation {
+            guarded: false,
+            tty: true,
+            modern: false,
+            double_clicked: true,
+            windows: true,
+        }
+    }
+
     #[test]
-    fn never_means_never() {
-        assert!(!should_relaunch(Mode::Never));
+    fn a_double_click_into_conhost_is_relaunched() {
+        assert!(decide(Mode::Auto, double_click()));
+    }
+
+    #[test]
+    fn a_shell_launch_is_left_alone_on_auto() {
+        // Человек сам открыл cmd и запустил клиент — уводить его в другое
+        // окно самоуправство. А вот `always` для того и заведён.
+        let from_shell = Situation {
+            double_clicked: false,
+            ..double_click()
+        };
+
+        assert!(!decide(Mode::Auto, from_shell));
+        assert!(decide(Mode::Always, from_shell));
+    }
+
+    #[test]
+    fn a_modern_terminal_is_never_disturbed() {
+        // Windows Terminal, WezTerm, VS Code, ssh: перезапуск здесь только
+        // мигнул бы лишним окном.
+        let modern = Situation {
+            modern: true,
+            ..double_click()
+        };
+
+        for mode in [Mode::Auto, Mode::Always] {
+            assert!(!decide(mode, modern), "{mode:?} тронул хорошее окно");
+        }
     }
 
     #[test]
     fn a_relaunched_process_does_not_relaunch_again() {
-        // Предохранитель важнее всех прочих проверок: без него перезапуск
-        // мог бы уйти в бесконечный цикл окон.
-        unsafe { std::env::set_var(GUARD, "1") };
-        let auto = should_relaunch(Mode::Auto);
-        let always = should_relaunch(Mode::Always);
-        unsafe { std::env::remove_var(GUARD) };
+        // Без предохранителя перезапуск ушёл бы в бесконечную череду окон.
+        let guarded = Situation {
+            guarded: true,
+            ..double_click()
+        };
 
-        assert!(!auto);
-        assert!(!always);
+        for mode in [Mode::Auto, Mode::Always] {
+            assert!(!decide(mode, guarded), "{mode:?} перезапустился повторно");
+        }
+    }
+
+    #[test]
+    fn a_redirected_run_is_left_alone() {
+        // Вывод в файл или канал: окна нет вовсе, и открывать его нельзя —
+        // иначе сборочная машина принялась бы плодить терминалы.
+        let piped = Situation {
+            tty: false,
+            ..double_click()
+        };
+
+        for mode in [Mode::Auto, Mode::Always] {
+            assert!(!decide(mode, piped), "{mode:?} открыл окно без терминала");
+        }
+    }
+
+    #[test]
+    fn never_means_never() {
+        assert!(!decide(Mode::Never, double_click()));
+        assert!(!should_relaunch(Mode::Never));
+    }
+
+    #[test]
+    fn other_systems_are_not_touched() {
+        // На macOS и Linux двойного клика по консольной программе нет, а
+        // терминал человек выбирает сам.
+        let elsewhere = Situation {
+            windows: false,
+            ..double_click()
+        };
+
+        for mode in [Mode::Auto, Mode::Always] {
+            assert!(!decide(mode, elsewhere), "{mode:?} полез не в свою систему");
+        }
     }
 
     #[test]
     fn tests_run_without_a_console_and_so_do_not_relaunch() {
-        // Под `cargo test` вывод перехвачен, то есть терминала нет. Проверка
-        // на это стоит раньше всех догадок про окно — иначе сборочная машина
-        // принялась бы открывать окна.
+        // Под `cargo test` вывод перехвачен: настоящая проверка обстановки
+        // должна это увидеть и промолчать.
         assert!(!should_relaunch(Mode::Auto));
+        assert!(!should_relaunch(Mode::Always));
     }
 }

@@ -1059,8 +1059,7 @@ async fn get_rooms(ws_url: &str) -> Vec<common::RoomSummary> {
         .trim_end_matches("/ws")
         .to_string();
     let mut stream = TcpStream::connect(&authority).await.unwrap();
-    let request =
-        format!("GET /rooms HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET /rooms HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();

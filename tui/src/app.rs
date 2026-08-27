@@ -977,7 +977,11 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
                                 } else {
                                     format!("{} чел.", room.users)
                                 };
-                                let here = if room.name == state.room { " · вы здесь" } else { "" };
+                                let here = if room.name == state.room {
+                                    " · вы здесь"
+                                } else {
+                                    ""
+                                };
                                 state.system(
                                     SystemKind::Info,
                                     format!("  /join {} — {people}{here}", room.name),
@@ -1165,7 +1169,9 @@ fn login_submit(state: &mut State) -> Vec<Command> {
     };
     // Комната, выбранная в списке, перевешивает поле: раз человек подсветил
     // строку и нажал Enter, он метил именно в неё.
-    let room_raw = login.chosen_room().unwrap_or_else(|| login.room.text.clone());
+    let room_raw = login
+        .chosen_room()
+        .unwrap_or_else(|| login.room.text.clone());
     let room = match validate::clean_room(&room_raw) {
         Ok(room) => room,
         Err(err) => {
@@ -2563,10 +2569,7 @@ mod tests {
         let (mut state, _) = State::new(None, "general".into());
         update(&mut state, Action::Rooms(Ok(some_rooms())));
 
-        update(
-            &mut state,
-            Action::Rooms(Err("сервер не ответил".into())),
-        );
+        update(&mut state, Action::Rooms(Err("сервер не ответил".into())));
 
         let Screen::Login(login) = &state.screen else {
             panic!("не экран входа");
