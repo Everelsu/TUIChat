@@ -429,6 +429,15 @@ async fn media_file(State(state): State<AppState>, UrlPath(id): UrlPath<Uuid>) -
     let Some(file) = state.media.get(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Картинку и звук показываем на месте, всё остальное отдаём только на
+    // скачивание. Это не придирка: произвольный файл раздаётся с того же
+    // адреса, что и сам чат, и покажи мы, скажем, html или svg прямо в
+    // браузере — присланный файл получил бы доступ к странице переписки.
+    // `attachment` заставляет браузер сохранить файл, а не исполнить его.
+    let disposition = match file.kind {
+        common::AttachmentKind::Image | common::AttachmentKind::Audio => "inline",
+        common::AttachmentKind::File => "attachment",
+    };
     (
         [
             (header::CONTENT_TYPE, file.mime),
@@ -437,7 +446,7 @@ async fn media_file(State(state): State<AppState>, UrlPath(id): UrlPath<Uuid>) -
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             // Имя файла в заголовок не кладём — оно пришло от человека, а в
             // интерфейсе и так показано.
-            (header::CONTENT_DISPOSITION, "inline"),
+            (header::CONTENT_DISPOSITION, disposition),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         file.bytes,

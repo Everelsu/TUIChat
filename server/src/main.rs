@@ -50,6 +50,11 @@ async fn serve_http(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn serve_https(addr: SocketAddr, dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // Провайдер выбираем явно: сборка собрана без умолчательного, иначе rustls
+    // притащил бы второй криптобэкенд рядом с тем, что уже использует QUIC.
+    // Ошибку глотаем — она означает лишь, что провайдер уже установлен.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let certificate = server::tls::ensure_certificate(&dir)?;
     let config = RustlsConfig::from_pem_file(&certificate.cert, &certificate.key).await?;
     announce("https", addr);

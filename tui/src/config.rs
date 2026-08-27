@@ -32,6 +32,10 @@ pub struct Config {
     /// двойного клика, `always` — из любого несовременного окна, `never` —
     /// никогда. Подробности — в `launcher`.
     pub terminal: String,
+    /// В каком терминале открываться: `wezterm`, `wt` или пусто — «выбирай
+    /// сам». Названный здесь терминал единственный, который годится: раз его
+    /// выбрали, уходить в другой молча нельзя.
+    pub terminal_program: String,
     /// Цвета ников: ключ — ник в нижнем регистре, значение — `#rrggbb`
     /// или название вроде `cyan`.
     pub colors: BTreeMap<String, String>,
@@ -46,6 +50,7 @@ impl Default for Config {
             last_dir: None,
             inline_images: None,
             terminal: "auto".to_string(),
+            terminal_program: String::new(),
             colors: BTreeMap::new(),
         }
     }

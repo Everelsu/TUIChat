@@ -21,10 +21,12 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
-    pub supported: bool,
+    /// Картинка или звук — то, что чат покажет прямо в ленте. Остальное
+    /// отправляется тоже, просто приходит строкой с именем и размером.
+    pub media: bool,
 }
 
-pub fn is_supported(path: &Path) -> bool {
+pub fn is_media(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| SUPPORTED.contains(&extension.to_lowercase().as_str()))
@@ -43,7 +45,7 @@ pub fn read_dir(path: &Path) -> Result<Vec<FileEntry>, String> {
             path: parent.to_path_buf(),
             is_dir: true,
             size: 0,
-            supported: false,
+            media: false,
         });
     }
 
@@ -58,7 +60,7 @@ pub fn read_dir(path: &Path) -> Result<Vec<FileEntry>, String> {
             }
             let meta = entry.metadata().ok()?;
             Some(FileEntry {
-                supported: !meta.is_dir() && is_supported(&path),
+                media: !meta.is_dir() && is_media(&path),
                 name,
                 path,
                 is_dir: meta.is_dir(),
@@ -116,10 +118,10 @@ mod tests {
 
     #[test]
     fn known_types_are_recognized() {
-        assert!(is_supported(Path::new("кот.PNG")));
-        assert!(is_supported(Path::new("голосовое.webm")));
-        assert!(!is_supported(Path::new("заметки.txt")));
-        assert!(!is_supported(Path::new("без_расширения")));
+        assert!(is_media(Path::new("кот.PNG")));
+        assert!(is_media(Path::new("голосовое.webm")));
+        assert!(!is_media(Path::new("заметки.txt")));
+        assert!(!is_media(Path::new("без_расширения")));
     }
 
     #[test]
@@ -138,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_files_are_listed_but_marked() {
+    fn plain_files_are_listed_and_marked_as_not_media() {
         let root = sample();
 
         let entries = read_dir(&root).unwrap();
@@ -146,9 +148,9 @@ mod tests {
         let notes = entries.iter().find(|entry| entry.name == "заметки.txt");
         // Файл видно, но помечен: прятать его хуже — человек пойдёт искать,
         // куда тот делся.
-        assert!(!notes.unwrap().supported);
+        assert!(!notes.unwrap().media);
         let picture = entries.iter().find(|entry| entry.name == "кот.png");
-        assert!(picture.unwrap().supported);
+        assert!(picture.unwrap().media);
 
         std::fs::remove_dir_all(&root).ok();
     }

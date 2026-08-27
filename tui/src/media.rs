@@ -202,6 +202,90 @@ async fn through_tunnel(ticket: &str, head: Vec<u8>, body: Vec<u8>) -> Result<Ve
     split_response(&response)
 }
 
+/// Форма волны голосового: столбики и длительность.
+///
+/// Считается по настоящим отсчётам, а не рисуется для красоты: показывать
+/// выдуманный график там, где человек ждёт увидеть свой голос, — обман, по
+/// которому потом нельзя понять, где в записи пауза, а где речь.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waveform {
+    /// Громкость по столбикам, 0..=8 — ровно столько ступеней у символов
+    /// от `▁` до `█`.
+    pub bars: Vec<u8>,
+    /// Длительность в миллисекундах, посчитанная по заголовку.
+    pub millis: u64,
+}
+
+/// Сколько столбиков рисуем. Больше в ленту всё равно не влезает.
+const WAVE_BARS: usize = 28;
+
+/// Достаёт форму волны из wav.
+///
+/// Разбираем заголовок руками: тянуть ради двух полей разборщик форматов
+/// незачем, а чужие форматы сюда и не попадают — в wav пишем мы сами.
+/// Не wav (браузерные webm и ogg) вернут `None`: их без декодера не прочесть,
+/// и это честнее, чем нарисовать что попало.
+pub fn waveform(bytes: &[u8]) -> Option<Waveform> {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+
+    // Идём по кускам: между заголовком и данными бывает что угодно.
+    let mut at = 12usize;
+    let mut channels = 1u16;
+    let mut rate = 16_000u32;
+    let mut bits = 16u16;
+    let mut data: Option<&[u8]> = None;
+
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = at + 8;
+        let end = body.checked_add(size)?.min(bytes.len());
+
+        if id == b"fmt " && end - body >= 16 {
+            channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().ok()?).max(1);
+            rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().ok()?).max(1);
+            bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().ok()?);
+        } else if id == b"data" {
+            data = Some(&bytes[body..end]);
+        }
+
+        // Куски выровнены по чётной границе.
+        at = body + size + (size & 1);
+    }
+
+    let data = data?;
+    if bits != 16 || data.len() < 2 {
+        return None;
+    }
+
+    let frames = data.len() / 2 / channels as usize;
+    let millis = (frames as u64 * 1000) / rate as u64;
+
+    // По каждому окну берём пик: именно он виден на глаз как громкость.
+    let per_bar = (data.len() / 2 / WAVE_BARS).max(1);
+    let mut peaks: Vec<u16> = Vec::with_capacity(WAVE_BARS);
+    for window in data.chunks(per_bar * 2).take(WAVE_BARS) {
+        let peak = window
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        peaks.push(peak);
+    }
+
+    // Нормируем по самому громкому месту: тихая запись иначе выглядела бы
+    // ровной полоской, хотя речь в ней слышна.
+    let loudest = peaks.iter().copied().max().unwrap_or(0).max(1);
+    let bars = peaks
+        .iter()
+        .map(|peak| ((*peak as u32 * 8) / loudest as u32).min(8) as u8)
+        .collect();
+
+    Some(Waveform { bars, millis })
+}
+
 /// Экранирует имя файла для строки запроса: в нём бывают пробелы и кириллица.
 fn escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -325,6 +409,80 @@ fn fit(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
         ((f64::from(width) * scale).round() as u32).max(1),
         ((f64::from(height) * scale).round() as u32).max(1),
     )
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+
+    /// Собирает wav 16 кГц моно из готовых отсчётов.
+    fn wav(samples: &[i16]) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((36 + data.len()) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // моно
+        out.extend_from_slice(&16_000u32.to_le_bytes());
+        out.extend_from_slice(&32_000u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn duration_comes_from_the_header() {
+        // Секунда при 16 кГц — ровно 16000 отсчётов.
+        let wave = waveform(&wav(&vec![0i16; 16_000])).expect("wav не разобран");
+
+        assert_eq!(wave.millis, 1000);
+        assert_eq!(wave.bars.len(), WAVE_BARS);
+    }
+
+    #[test]
+    fn loud_places_are_taller_than_quiet_ones() {
+        // Первая половина тихая, вторая громкая: график обязан это показать,
+        // иначе по нему нельзя понять, где в записи речь.
+        let mut samples = vec![100i16; 16_000];
+        samples.extend(std::iter::repeat_n(20_000i16, 16_000));
+
+        let wave = waveform(&wav(&samples)).expect("wav не разобран");
+
+        let half = wave.bars.len() / 2;
+        let quiet: u32 = wave.bars[..half].iter().map(|b| *b as u32).sum();
+        let loud: u32 = wave.bars[half..].iter().map(|b| *b as u32).sum();
+        assert!(
+            loud > quiet * 2,
+            "тихо {quiet}, громко {loud}: {:?}",
+            wave.bars
+        );
+    }
+
+    #[test]
+    fn a_quiet_recording_still_shows_something() {
+        // Нормировка по самому громкому: иначе тихая запись выглядела бы
+        // ровной полоской, хотя речь в ней слышна.
+        let mut samples = vec![0i16; 8_000];
+        samples.extend(std::iter::repeat_n(300i16, 8_000));
+
+        let wave = waveform(&wav(&samples)).expect("wav не разобран");
+
+        assert_eq!(wave.bars.iter().copied().max(), Some(8));
+    }
+
+    #[test]
+    fn what_is_not_a_wav_is_refused_rather_than_invented() {
+        // Браузерные webm и ogg без декодера не прочесть. Нарисовать по ним
+        // «что-нибудь» значило бы показать человеку выдуманный голос.
+        assert!(waveform(b"OggS not a wav at all").is_none());
+        assert!(waveform(&[]).is_none());
+        assert!(waveform(&wav(&[])).is_none());
+    }
 }
 
 #[cfg(test)]

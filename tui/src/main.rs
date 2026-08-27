@@ -68,7 +68,7 @@ async fn main() -> io::Result<()> {
         .or(Some(config.terminal.as_str()))
         .and_then(launcher::Mode::parse)
         .unwrap_or_default();
-    if launcher::relaunch_if_needed(terminal_mode) {
+    if launcher::relaunch_if_needed(terminal_mode, &config.terminal_program) {
         return Ok(());
     }
     let server = args.server.unwrap_or_else(|| config.server.clone());
@@ -257,11 +257,22 @@ async fn run(
         // Звук — такой же побочный эффект, как звоночек: байтам голосового
         // в состоянии клиента делать нечего.
         let action = match action {
-            Action::Voice(Ok(bytes)) => match sound.play_voice(bytes) {
-                Ok(()) => Action::Idle,
-                Err(reason) => Action::Notice(reason),
-            },
-            Action::Voice(Err(reason)) => Action::Notice(reason),
+            Action::Voice(id, Ok(bytes)) => {
+                // Форму волны считаем по тем же байтам, что и играем: второй
+                // раз качать ради графика было бы расточительно.
+                let wave = media::waveform(&bytes);
+                let outcome = match sound.play_voice(bytes) {
+                    Ok(()) => Action::Idle,
+                    Err(reason) => Action::Notice(reason),
+                };
+                // График кладём до проигрывания: даже если звука на машине
+                // нет, увидеть длительность и форму — уже польза.
+                if let Some(wave) = wave {
+                    let _ = actions.send(Action::Waveform(id, wave));
+                }
+                outcome
+            }
+            Action::Voice(_, Err(reason)) => Action::Notice(reason),
             other => other,
         };
 
@@ -275,6 +286,15 @@ async fn run(
             &mut sound,
             commands,
         );
+
+        // Состояние звука знает только звук, а клавише F3 надо решать,
+        // включать или останавливать: переносим его в состояние каждый кадр.
+        state.playing = sound.is_playing();
+        // Досмотренная заливка не должна бежать дальше: когда звук кончился,
+        // график возвращается в спокойный вид.
+        if !state.playing {
+            state.playing_voice = None;
+        }
 
         if sound.is_recording() {
             state.busy = Some(format!(
@@ -341,7 +361,7 @@ fn apply(
             Command::Fetch(id, url) => fetch_image(id, url, actions.clone()),
             Command::Upload(path) => upload_file(state.media_base.clone(), path, actions.clone()),
             Command::ReadDir(path) => read_dir(path, actions.clone()),
-            Command::PlayVoice(url) => fetch_voice(url, actions.clone()),
+            Command::PlayVoice(id, url) => fetch_voice(id, url, actions.clone()),
             Command::StopVoice => sound.stop_voice(),
             Command::ToggleRecording => toggle_recording(sound, state, actions.clone()),
             Command::Save { url, destination } => save_file(url, destination, actions.clone()),
@@ -485,10 +505,10 @@ fn read_dir(path: PathBuf, actions: UnboundedSender<Action>) {
 }
 
 /// Качает голосовое и отдаёт байты главному циклу.
-fn fetch_voice(url: String, actions: UnboundedSender<Action>) {
+fn fetch_voice(id: uuid::Uuid, url: String, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
         let result = media::fetch_any(url).await;
-        let _ = actions.send(Action::Voice(result));
+        let _ = actions.send(Action::Voice(id, result));
     });
 }
 
@@ -595,6 +615,12 @@ fn spawn_input(actions: UnboundedSender<Action>) {
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::ScrollUp => Action::Scroll(3),
                     MouseEventKind::ScrollDown => Action::Scroll(-3),
+                    // Щелчок по ленте: строку под курсором интерфейс
+                    // сопоставит с сообщением сам — здесь известны только
+                    // экранные координаты.
+                    MouseEventKind::Down(event::MouseButton::Left) => {
+                        Action::Click(mouse.column, mouse.row)
+                    }
                     _ => continue,
                 },
                 // Перерисовать после изменения размера окна.

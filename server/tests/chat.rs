@@ -716,18 +716,50 @@ async fn uploaded_image_is_described_by_the_server() {
 }
 
 #[tokio::test]
-async fn non_image_upload_is_rejected() {
+async fn any_file_can_be_sent_but_only_media_is_shown_in_place() {
     let url = spawn().await;
 
-    // Скрипт под видом картинки: раздавали бы мы его со своего же адреса.
-    let (head, _) = http_post(
+    // Отправить можно что угодно — хоть скрипт под видом картинки. Но
+    // раздаётся он с того же адреса, что и переписка, поэтому показать его
+    // в браузере нельзя ни при каких условиях: только отдать на скачивание.
+    let (head, body) = http_post(
         &url,
         "/upload?name=evil.svg",
         b"<svg onload=alert(1)></svg>",
     )
     .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 
-    assert!(head.starts_with("HTTP/1.1 415"), "{head}");
+    let attachment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(attachment["kind"], "file");
+    assert_eq!(attachment["mime"], "application/octet-stream");
+
+    let id = attachment["id"].as_str().unwrap();
+    let response = http_get(&url, &format!("/media/{id}")).await;
+    let headers = response.to_lowercase();
+
+    // Вот это и защищает: браузер сохранит файл, а не исполнит его.
+    assert!(
+        headers.contains("content-disposition: attachment"),
+        "произвольный файл отдан на показ, а не на скачивание: {response:.400}"
+    );
+    assert!(
+        headers.contains("x-content-type-options: nosniff"),
+        "{response:.400}"
+    );
+    assert!(
+        headers.contains("content-type: application/octet-stream"),
+        "{response:.400}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_upload_is_refused() {
+    let url = spawn().await;
+
+    let (head, _) = http_post(&url, "/upload?name=пусто.bin", b"").await;
+
+    assert!(head.starts_with("HTTP/1.1 4"), "{head}");
 }
 
 #[tokio::test]

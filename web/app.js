@@ -321,6 +321,14 @@ function clearReply() {
   ui.replyText.textContent = "";
 }
 
+/// Размер файла по-человечески: «240 КБ» читается, «245760» — нет.
+function humanSize(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
 function attachmentNode(attachment) {
   const url = `/media/${attachment.id}`;
   if (attachment.kind === "audio") {
@@ -332,10 +340,15 @@ function attachmentNode(attachment) {
     return audio;
   }
   if (attachment.kind !== "image") {
+    // Обычный файл: показывать нечего, поэтому даём его скачать. Имя и размер
+    // рядом — по ним видно, стоит ли качать вообще.
     const link = document.createElement("a");
     link.className = "file";
     link.href = url;
-    link.textContent = `[${attachment.name}]`;
+    // Сервер и так отдаёт такой файл с Content-Disposition: attachment, но
+    // download просит браузер сохранить его под настоящим именем.
+    link.download = attachment.name;
+    link.textContent = `▤ ${attachment.name} · ${humanSize(attachment.size)}`;
     return link;
   }
 

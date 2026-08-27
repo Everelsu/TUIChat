@@ -5,7 +5,12 @@ edition.workspace = true
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+# Провайдер криптографии подключаем сами (`tls-rustls-no-provider`), а не берём
+# из умолчаний: по умолчанию сюда приезжает aws-lc-rs — C-библиотека, которая
+# компилируется отдельно и тянет за собой мегабайты. Ring в сборке и так есть,
+# его использует QUIC в туннеле, так что второй бэкенд был бы чистым весом.
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 common.workspace = true
 futures-util = "0.3.31"
 if-addrs = "0.15.0"

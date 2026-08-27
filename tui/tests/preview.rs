@@ -124,6 +124,6 @@ fn file(name: &str, is_dir: bool, size: u64) -> tui::files::FileEntry {
         path: std::path::PathBuf::from(name),
         is_dir,
         size,
-        supported: !is_dir && tui::files::is_supported(std::path::Path::new(name)),
+        media: !is_dir && tui::files::is_media(std::path::Path::new(name)),
     }
 }

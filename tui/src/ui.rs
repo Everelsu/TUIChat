@@ -73,6 +73,50 @@ const THUMB_COLS: u16 = 46;
 /// Сколько живёт вспышка у нового сообщения.
 const FLASH: std::time::Duration = std::time::Duration::from_millis(900);
 
+/// Ступени столбика громкости: восемь уровней плюс тишина.
+const WAVE_STEPS: [&str; 9] = ["▁", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// Рисует голосовое графиком: столбики громкости и длительность.
+///
+/// Пока запись играет, пройденная часть подсвечена — по ней видно, сколько
+/// осталось, а заодно понятно, что звук вообще идёт: в терминале это иначе
+/// никак не показать.
+fn draw_voice(
+    wave: &media::Waveform,
+    playing: Option<std::time::Duration>,
+    name: &str,
+) -> Vec<Span<'static>> {
+    let played = match playing {
+        // Доля проигранного. Ноль длительности означает «ещё не знаем» —
+        // тогда просто ничего не подсвечиваем.
+        Some(elapsed) if wave.millis > 0 => {
+            (elapsed.as_millis() as f32 / wave.millis as f32).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    };
+    let edge = (played * wave.bars.len() as f32).round() as usize;
+
+    let mut spans = vec![Span::styled("♪ ", Style::new().fg(palette::ACCENT))];
+    for (index, level) in wave.bars.iter().enumerate() {
+        let step = WAVE_STEPS[(*level as usize).min(WAVE_STEPS.len() - 1)];
+        // Пройденное — акцентом, остальное приглушено: граница между ними и
+        // есть указатель воспроизведения.
+        let colour = if index < edge {
+            palette::ACCENT
+        } else {
+            palette::DIM
+        };
+        spans.push(Span::styled(step.to_string(), Style::new().fg(colour)));
+    }
+
+    let seconds = wave.millis / 1000;
+    spans.push(Span::styled(
+        format!("  {}:{:02}  {name}", seconds / 60, seconds % 60),
+        Style::new().fg(palette::FAINT),
+    ));
+    spans
+}
+
 pub fn draw(frame: &mut Frame, state: &mut State, images: &mut Images) {
     if let Screen::Login(login) = &state.screen {
         draw_login(frame, login, frame.area());
@@ -143,21 +187,27 @@ fn draw_browser(frame: &mut Frame, browser: &Browser, area: Rect) {
             .take(height)
             .map(|(index, entry)| {
                 let chosen = index == browser.selected;
+                // Приглушать нечего: отправить можно любой файл. Каталог
+                // выделен цветом, всё остальное — обычным.
                 let color = if entry.is_dir {
                     palette::ACCENT
-                } else if entry.supported {
-                    Color::Reset
                 } else {
-                    // Неподдерживаемое видно, но приглушено: прятать хуже —
-                    // человек пойдёт искать, куда делся его файл.
-                    palette::FAINT
+                    Color::Reset
                 };
                 let mut style = Style::new().fg(color);
                 if chosen {
                     style = style.bg(palette::FAINT).fg(Color::Rgb(20, 20, 24));
                 }
 
-                let mark = if entry.is_dir { "▸ " } else { "  " };
+                // Метка говорит, что случится после отправки: картинка и звук
+                // покажутся прямо в переписке, остальное придёт строкой.
+                let mark = if entry.is_dir {
+                    "▸ "
+                } else if entry.media {
+                    "◈ "
+                } else {
+                    "  "
+                };
                 let size = if entry.is_dir {
                     String::new()
                 } else {
@@ -355,10 +405,14 @@ fn draw_messages(frame: &mut Frame, state: &mut State, area: Rect, images: &mut 
     } = render_entries(
         &state.entries,
         width,
-        state.search.as_ref(),
-        state.picking,
-        &state.colors,
-        &state.thumbnails,
+        &Decor {
+            search: state.search.as_ref(),
+            picking: state.picking.map(|pick| pick.index),
+            colors: &state.colors,
+            thumbnails: &state.thumbnails,
+            waveforms: &state.waveforms,
+            playing: state.playing_voice,
+        },
     );
     // Карта «запись -> строка» нужна поиску, чтобы прокрутить к найденному:
     // во сколько строк развернулось сообщение, известно только здесь.
@@ -367,6 +421,7 @@ fn draw_messages(frame: &mut Frame, state: &mut State, area: Rect, images: &mut 
     state.viewport = Viewport {
         height,
         total_lines: lines.len(),
+        top: area.y,
     };
 
     // Прокрутка держится за низ истории: клампим здесь, потому что размеры
@@ -503,14 +558,26 @@ fn draw_hint(frame: &mut Frame, state: &State, area: Rect) {
 
     let hint = if state.viewer.is_some() {
         "esc закрыть картинку"
-    } else if state.picking.is_some() {
-        "стрелки — выбрать сообщение · enter ответить · esc отмена"
+    } else if let Some(pick) = state.picking {
+        match pick.mode {
+            crate::app::PickMode::Reply => {
+                "стрелки — выбрать сообщение · enter ответить · esc отмена"
+            }
+            // Здесь важно назвать все три действия: человек пришёл сюда
+            // именно потому, что ему нужно не последнее вложение.
+            crate::app::PickMode::Attachment => {
+                "стрелки — вложение · enter открыть · f3 играть · f5 сохранить · esc отмена"
+            }
+        }
     } else if state.replying.is_some() {
         "enter отправить ответ · esc снять цитату"
     } else if state.search.is_some() {
         "enter и стрелки — следующее совпадение · esc закрыть поиск"
     } else {
-        "enter отправить · tab дополнить · ctrl+o файл · /help — остальное"
+        // Подсказка называет то, ради чего чат и открывают, и называет
+        // клавишами, а не командами: человеку, который не пишет код, строка
+        // со слэшем ничего не говорит.
+        "f2 голосовое · f4 файл · f7 выбрать вложение · f1 всё остальное"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -797,14 +864,31 @@ struct Rendered {
     slots: Vec<Slot>,
 }
 
-fn render_entries(
-    entries: &[Entry],
-    width: usize,
-    search: Option<&Search>,
-    picking: Option<usize>,
-    colors: &Colors,
-    thumbnails: &HashMap<uuid::Uuid, Thumbnail>,
-) -> Rendered {
+/// Всё, чем лента раскрашивается: подсветка поиска и выбора, цвета ников,
+/// готовые миниатюры и формы волны.
+///
+/// Собрано в структуру, потому что список рос с каждой возможностью, а восемь
+/// позиционных аргументов подряд перепутать проще, чем заметить.
+pub struct Decor<'a> {
+    pub search: Option<&'a Search>,
+    pub picking: Option<usize>,
+    pub colors: &'a Colors,
+    pub thumbnails: &'a HashMap<uuid::Uuid, Thumbnail>,
+    pub waveforms: &'a HashMap<uuid::Uuid, media::Waveform>,
+    /// Что играет прямо сейчас и с какого момента — по этому закрашивается
+    /// пройденная часть формы волны.
+    pub playing: Option<(uuid::Uuid, std::time::Instant)>,
+}
+
+fn render_entries(entries: &[Entry], width: usize, decor: &Decor<'_>) -> Rendered {
+    let Decor {
+        search,
+        picking,
+        colors,
+        thumbnails,
+        waveforms,
+        playing,
+    } = *decor;
     let now = std::time::Instant::now();
     let mut lines = Vec::new();
     let mut offsets = Vec::with_capacity(entries.len());
@@ -876,12 +960,34 @@ fn render_entries(
                     }
                 });
 
+                // Голосовое с разобранной формой волны рисуем графиком, а не
+                // строкой: по столбикам видно, где в записи речь, а где пауза,
+                // и сколько её осталось.
+                let voice = attachment.as_ref().and_then(|attachment| {
+                    let wave = waveforms.get(&attachment.id)?;
+                    let elapsed = playing
+                        .filter(|(id, _)| *id == attachment.id)
+                        .map(|(_, since)| now.saturating_duration_since(since));
+                    Some(draw_voice(wave, elapsed, &attachment.name))
+                });
+
                 // Подпись остаётся в любом случае: по ней видно имя и размер,
                 // а полный адрес в ленте рвался бы переносом.
                 let body = match attachment {
                     Some(attachment) => {
-                        let label =
-                            format!("[{} · {}]", attachment.name, human_size(attachment.size));
+                        // Значок сразу говорит, что пришло и что с этим делать:
+                        // картинку посмотреть, голосовое послушать, файл
+                        // сохранить.
+                        let mark = match attachment.kind {
+                            common::AttachmentKind::Image => "◈",
+                            common::AttachmentKind::Audio => "♪",
+                            common::AttachmentKind::File => "▤",
+                        };
+                        let label = format!(
+                            "[{mark} {} · {}]",
+                            attachment.name,
+                            human_size(attachment.size)
+                        );
                         if text.is_empty() {
                             label
                         } else {
@@ -910,14 +1016,39 @@ fn render_entries(
                 } else {
                     Style::new()
                 };
-                push_wrapped(
-                    &mut lines,
-                    style,
-                    &body,
-                    width,
-                    highlight,
-                    fade(*arrived, now),
-                );
+                match &voice {
+                    // График вместо строки: переносить его нельзя, он и так
+                    // укладывается в ширину ленты.
+                    Some(spans) => {
+                        let mut line = vec![Span::raw(format!("{GUTTER} "))];
+                        line.extend(spans.iter().cloned());
+                        let mut rendered = Line::from(line);
+                        if let Some(colour) = highlight {
+                            rendered = rendered.style(Style::new().bg(colour));
+                        }
+                        lines.push(rendered);
+                        // Подпись под графиком нужна, только если человек
+                        // что-то написал вместе с голосовым.
+                        if !text.is_empty() {
+                            push_wrapped(
+                                &mut lines,
+                                style,
+                                text,
+                                width,
+                                highlight,
+                                fade(*arrived, now),
+                            );
+                        }
+                    }
+                    None => push_wrapped(
+                        &mut lines,
+                        style,
+                        &body,
+                        width,
+                        highlight,
+                        fade(*arrived, now),
+                    ),
+                }
                 if let Some(id) = inline {
                     slots.push(Slot {
                         line: lines.len(),
@@ -1420,7 +1551,7 @@ mod tests {
                     path: std::path::PathBuf::from("C:/кот.png"),
                     is_dir: false,
                     size: 1024,
-                    supported: true,
+                    media: true,
                 }],
                 selected: 0,
                 filter: Input::default(),
@@ -1465,7 +1596,7 @@ mod tests {
 
         let mut ready = HashMap::new();
         ready.insert(id, Thumbnail::Ready(Box::new(image::RgbImage::new(4, 4))));
-        let with_picture = render_entries(&entries, 40, None, None, &HashMap::new(), &ready);
+        let with_picture = render_entries(&entries, 40, &plain_decor(&ready));
 
         assert_eq!(with_picture.slots.len(), 1);
         // Под картинку зарезервированы пустые строки: сам рисунок ложится
@@ -1475,14 +1606,29 @@ mod tests {
         // Пока картинка не скачана, места под неё не занимаем.
         let mut loading = HashMap::new();
         loading.insert(id, Thumbnail::Loading);
-        let without = render_entries(&entries, 40, None, None, &HashMap::new(), &loading);
+        let without = render_entries(&entries, 40, &plain_decor(&loading));
 
         assert!(without.slots.is_empty());
         assert!(without.lines.len() < with_picture.lines.len());
     }
 
+    /// Оформление без подсветки: интересны только миниатюры.
+    fn plain_decor(thumbnails: &HashMap<uuid::Uuid, Thumbnail>) -> Decor<'_> {
+        static EMPTY_COLORS: std::sync::LazyLock<Colors> = std::sync::LazyLock::new(Colors::new);
+        static EMPTY_WAVES: std::sync::LazyLock<HashMap<uuid::Uuid, media::Waveform>> =
+            std::sync::LazyLock::new(HashMap::new);
+        Decor {
+            search: None,
+            picking: None,
+            colors: &EMPTY_COLORS,
+            thumbnails,
+            waveforms: &EMPTY_WAVES,
+            playing: None,
+        }
+    }
+
     #[test]
-    fn browser_shows_files_and_marks_the_unsupported() {
+    fn browser_shows_files_and_marks_media() {
         let mut state = populated();
         state.browser = Some(Browser {
             dir: std::path::PathBuf::from("C:/фото"),
@@ -1492,14 +1638,14 @@ mod tests {
                     path: std::path::PathBuf::from("C:/"),
                     is_dir: true,
                     size: 0,
-                    supported: false,
+                    media: false,
                 },
                 crate::files::FileEntry {
                     name: "кот.png".into(),
                     path: std::path::PathBuf::from("C:/фото/кот.png"),
                     is_dir: false,
                     size: 240 * 1024,
-                    supported: true,
+                    media: true,
                 },
             ],
             selected: 1,
@@ -1526,6 +1672,67 @@ mod tests {
         assert!(long.starts_with('…'), "{long}");
         assert!(long.ends_with("фото"), "{long}");
         assert!(long.width() <= 20, "{long}");
+    }
+
+    fn voice_line(playing: Option<std::time::Duration>) -> String {
+        let wave = media::Waveform {
+            bars: vec![1, 4, 8, 6, 2, 7, 3, 5],
+            millis: 8_000,
+        };
+        draw_voice(&wave, playing, "голосовое.wav")
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_voice_is_drawn_as_a_graph_with_its_length() {
+        let line = voice_line(None);
+
+        // Столбики разной высоты — по ним и видно, где речь, а где пауза.
+        assert!(line.contains('█'), "{line}");
+        assert!(line.contains('▁'), "{line}");
+        // Длительность из заголовка, а не «столько-то килобайт».
+        assert!(line.contains("0:08"), "{line}");
+        assert!(line.contains("голосовое.wav"), "{line}");
+    }
+
+    #[test]
+    fn playback_paints_the_part_already_heard() {
+        let wave = media::Waveform {
+            bars: vec![4; 8],
+            millis: 8_000,
+        };
+
+        // На середине записи ровно половина столбиков должна быть акцентной:
+        // граница между цветами и есть указатель воспроизведения.
+        let spans = draw_voice(&wave, Some(std::time::Duration::from_secs(4)), "г.wav");
+        let accented = spans
+            .iter()
+            .skip(1) // первый — значок ♪
+            .take(8)
+            .filter(|span| span.style.fg == Some(palette::ACCENT))
+            .count();
+
+        assert_eq!(accented, 4, "закрашено не половина: {accented}");
+    }
+
+    #[test]
+    fn a_voice_that_is_not_playing_is_not_painted() {
+        let wave = media::Waveform {
+            bars: vec![4; 8],
+            millis: 8_000,
+        };
+
+        let spans = draw_voice(&wave, None, "г.wav");
+        let accented = spans
+            .iter()
+            .skip(1)
+            .take(8)
+            .filter(|span| span.style.fg == Some(palette::ACCENT))
+            .count();
+
+        assert_eq!(accented, 0, "график закрашен, хотя ничего не играет");
     }
 
     #[test]

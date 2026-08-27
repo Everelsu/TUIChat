@@ -51,7 +51,13 @@ const GUARD: &str = "TUICHAT_LAUNCHED";
 /// iTerm2, а значит миниатюры в ленте показываются по-настоящему, а не
 /// полублоками. Если его нет — Windows Terminal, он всё равно на голову выше
 /// conhost.
-const TERMINALS: [Terminal; 2] = [
+const TERMINALS: [Terminal; 3] = [
+    // Именно `wezterm-gui`, а не `wezterm`: второй собран как консольная
+    // программа, и запуск через него мигает лишним чёрным окном.
+    Terminal {
+        exe: "wezterm-gui.exe",
+        kind: Kind::WezTerm,
+    },
     Terminal {
         exe: "wezterm.exe",
         kind: Kind::WezTerm,
@@ -74,17 +80,29 @@ enum Kind {
     WindowsTerminal,
 }
 
+impl Kind {
+    /// Разбирает имя терминала из настроек. Пусто или незнакомое — `None`,
+    /// то есть «выбирай сам по порядку предпочтения».
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "wezterm" => Some(Kind::WezTerm),
+            "wt" | "windows-terminal" | "windows terminal" => Some(Kind::WindowsTerminal),
+            _ => None,
+        }
+    }
+}
+
 /// Перезапускает клиент в подходящем терминале.
 ///
 /// Возвращает `true`, если новое окно открыто и этому процессу пора уходить.
 /// Любая заминка — терминала нет, запуск не удался — означает `false`: тогда
 /// клиент просто работает здесь. Остаться в кривом окне неприятно, а вот не
 /// запуститься вовсе — уже поломка.
-pub fn relaunch_if_needed(mode: Mode) -> bool {
+pub fn relaunch_if_needed(mode: Mode, prefer: &str) -> bool {
     if !should_relaunch(mode) {
         return false;
     }
-    let Some(terminal) = find_terminal() else {
+    let Some(terminal) = find_terminal(prefer) else {
         return false;
     };
     let Ok(exe) = std::env::current_exe() else {
@@ -211,9 +229,14 @@ fn double_clicked() -> bool {
 }
 
 /// Первый из установленных терминалов по порядку предпочтения.
-fn find_terminal() -> Option<(Terminal, PathBuf)> {
+fn find_terminal(prefer: &str) -> Option<(Terminal, PathBuf)> {
+    let wanted = Kind::parse(prefer);
     TERMINALS
         .iter()
+        // Названный в настройках терминал — единственный, который годится:
+        // раз человек его выбрал, молча уходить в другой нельзя. Не найдётся —
+        // останемся в текущем окне, это честнее подмены.
+        .filter(|terminal| wanted.is_none_or(|kind| terminal.kind == kind))
         .find_map(|terminal| which(terminal.exe).map(|path| (*terminal, path)))
 }
 
@@ -231,12 +254,24 @@ fn which(exe: &str) -> Option<PathBuf> {
         }
     }
 
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let candidate = PathBuf::from(local)
-        .join("Microsoft")
-        .join("WindowsApps")
-        .join(exe);
-    candidate.is_file().then_some(candidate)
+    // Дальше — места, куда терминалы ставятся, но которые в `PATH` попадают
+    // не всегда. Windows Terminal приезжает из магазина и живёт в WindowsApps;
+    // WezTerm ставится в Program Files, а `PATH` в уже открытой сессии об этом
+    // не узнает до перезапуска — то есть ровно тогда, когда мы и ищем.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("Microsoft").join("WindowsApps"));
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = std::env::var_os(variable) {
+            roots.push(PathBuf::from(root).join("WezTerm"));
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|root| root.join(exe))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Открывает клиент в выбранном терминале.
@@ -248,28 +283,51 @@ fn spawn(
     exe: &std::path::Path,
     args: &[OsString],
 ) -> std::io::Result<std::process::Child> {
-    let mut command = Command::new(path);
     let cwd = std::env::current_dir().ok();
+    let mut command = Command::new(path);
+    command
+        .args(arguments(terminal.kind, cwd.as_deref(), exe, args))
+        .env(GUARD, "1");
+    command.spawn()
+}
 
-    match terminal.kind {
+/// Собирает строку запуска для выбранного терминала.
+///
+/// Отдельно от самого запуска, потому что порядок здесь имеет значение и
+/// молча ломается: у каждого терминала свои правила, а проверить их иначе
+/// как открыв окно — никак.
+fn arguments(
+    kind: Kind,
+    cwd: Option<&std::path::Path>,
+    exe: &std::path::Path,
+    args: &[OsString],
+) -> Vec<OsString> {
+    let mut line: Vec<OsString> = Vec::new();
+    match kind {
         Kind::WindowsTerminal => {
             // Каталог запуска задаём явно: иначе окно откроется в домашнем,
             // и относительные пути в /send перестанут находиться.
-            if let Some(cwd) = &cwd {
-                command.arg("-d").arg(cwd);
+            if let Some(cwd) = cwd {
+                line.push("-d".into());
+                line.push(cwd.into());
             }
-            command.arg("--");
         }
         Kind::WezTerm => {
-            if let Some(cwd) = &cwd {
-                command.arg("--cwd").arg(cwd);
+            // Порядок важен: `--cwd` принадлежит подкоманде `start`, а не
+            // самому wezterm. Поставь его раньше — запуск просто не поймут.
+            line.push("start".into());
+            if let Some(cwd) = cwd {
+                line.push("--cwd".into());
+                line.push(cwd.into());
             }
-            command.arg("start").arg("--");
         }
     }
-
-    command.arg(exe).args(args).env(GUARD, "1");
-    command.spawn()
+    // Двойной дефис отделяет наши аргументы от аргументов терминала: без него
+    // `--nick` разбирал бы уже терминал, а не мы.
+    line.push("--".into());
+    line.push(exe.into());
+    line.extend(args.iter().cloned());
+    line
 }
 
 #[cfg(test)]
@@ -373,6 +431,89 @@ mod tests {
         for mode in [Mode::Auto, Mode::Always] {
             assert!(!decide(mode, elsewhere), "{mode:?} полез не в свою систему");
         }
+    }
+
+    /// Строка запуска в виде, удобном для сравнения.
+    fn line(kind: Kind) -> Vec<String> {
+        arguments(
+            kind,
+            Some(std::path::Path::new(r"C:\work")),
+            std::path::Path::new(r"C:\chat\tui.exe"),
+            &["--nick".into(), "alice".into()],
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect()
+    }
+
+    #[test]
+    fn our_arguments_are_separated_from_the_terminals_own() {
+        // Без двойного дефиса `--nick` разобрал бы сам терминал и запуск
+        // развалился бы — причём молча.
+        for kind in [Kind::WindowsTerminal, Kind::WezTerm] {
+            let line = line(kind);
+            let dashes = line.iter().position(|arg| arg == "--").expect("нет «--»");
+            let nick = line.iter().position(|arg| arg == "--nick").unwrap();
+            assert!(dashes < nick, "{line:?}");
+            assert_eq!(line.last().unwrap(), "alice", "{line:?}");
+        }
+    }
+
+    #[test]
+    fn wezterm_gets_the_working_directory_after_its_subcommand() {
+        // `--cwd` принадлежит подкоманде `start`. Поставленный раньше, он
+        // просто не понимается — а окно при этом откроется не там, где надо.
+        let line = line(Kind::WezTerm);
+
+        let start = line
+            .iter()
+            .position(|arg| arg == "start")
+            .expect("нет start");
+        let cwd = line
+            .iter()
+            .position(|arg| arg == "--cwd")
+            .expect("нет --cwd");
+        assert!(start < cwd, "{line:?}");
+        assert_eq!(line[cwd + 1], r"C:\work", "{line:?}");
+    }
+
+    #[test]
+    fn windows_terminal_gets_the_working_directory_before_the_dashes() {
+        // Без каталога окно откроется в домашнем, и относительные пути в
+        // /send перестанут находиться.
+        let line = line(Kind::WindowsTerminal);
+
+        assert_eq!(line[0], "-d", "{line:?}");
+        assert_eq!(line[1], r"C:\work", "{line:?}");
+        assert_eq!(line[2], "--", "{line:?}");
+    }
+
+    #[test]
+    fn a_named_terminal_is_the_only_one_considered() {
+        // Человек написал в настройках «wt» — значит, уводить его в WezTerm
+        // нельзя, даже если тот стоит и в списке идёт раньше.
+        assert_eq!(Kind::parse("wt"), Some(Kind::WindowsTerminal));
+        assert_eq!(Kind::parse(" WezTerm "), Some(Kind::WezTerm));
+        assert_eq!(Kind::parse("windows-terminal"), Some(Kind::WindowsTerminal));
+
+        // Пусто и незнакомое означают «выбирай сам»: отказываться запускаться
+        // из-за опечатки в настройках — худшее, что можно сделать.
+        assert_eq!(Kind::parse(""), None);
+        assert_eq!(Kind::parse("ghostty"), None);
+    }
+
+    #[test]
+    fn wezterm_is_preferred_over_windows_terminal() {
+        // У WezTerm есть протокол картинок iTerm2 — миниатюры в ленте
+        // показываются по-настоящему. Порядок списка это и означает.
+        let kinds: Vec<Kind> = TERMINALS.iter().map(|terminal| terminal.kind).collect();
+        let wezterm = kinds.iter().position(|kind| *kind == Kind::WezTerm);
+        let windows = kinds.iter().position(|kind| *kind == Kind::WindowsTerminal);
+
+        assert!(wezterm < windows, "{kinds:?}");
+        // Консольный `wezterm.exe` мигает лишним окном, поэтому GUI-бинарь
+        // должен проверяться раньше.
+        assert_eq!(TERMINALS[0].exe, "wezterm-gui.exe");
     }
 
     #[test]

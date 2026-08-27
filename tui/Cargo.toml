@@ -21,7 +21,11 @@ toml = "1.1.4"
 unicode-width = "0.2.2"
 uuid.workspace = true
 axum = "0.8.9"
-iroh = "1.1.0"
+# Из умолчаний выброшены metrics (счётчики, которые мы нигде не показываем) и
+# fast-apple-datapath (ускорение сокетов macOS — на Windows и Linux мёртвый вес).
+# portmapper оставлен намеренно: он просит роутер открыть порт и заметно
+# повышает долю прямых соединений вместо релея.
+iroh = { version = "1.1.0", default-features = false, features = ["tls-ring", "portmapper"] }
 
 [dev-dependencies]
 axum = "0.8.9"

@@ -21,6 +21,39 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// QUIC и обмен адресами занимают заметное время.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// Сколько раз пробуем подключиться, прежде чем считать это поломкой.
+///
+/// Рукопожатие QUIC — настоящая сетевая работа, и когда рядом идёт вся
+/// остальная сборка, одна попытка может не успеть. Три подряд не успеют только
+/// если сломано на самом деле: молча проглотить настоящую поломку это не даёт.
+const ATTEMPTS: usize = 3;
+
+/// Подключается к туннелю, переживая единичную неудачу под нагрузкой.
+///
+/// Сначала дожидается прямого адреса. Сразу после запуска его может не быть —
+/// в `addr()` лежит только релей, и соединение даже с самим собой пошло бы
+/// через интернет: медленно, а под нагрузкой и вовсе мимо.
+async fn dial(tunnel: &tui::tunnel::Tunnel) -> tui::tunnel::Duplex {
+    let waited = timeout(PATIENCE, async {
+        while tunnel.direct_addrs() == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "прямой адрес так и не появился");
+
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match timeout(PATIENCE, tui::tunnel::connect_to(tunnel.addr())).await {
+            Ok(Ok(duplex)) => return duplex,
+            Ok(Err(reason)) => last = reason,
+            Err(_) => last = "не уложились в срок".to_string(),
+        }
+        eprintln!("попытка {attempt} из {ATTEMPTS} не удалась: {last}");
+    }
+    panic!("не удалось подключиться через туннель за {ATTEMPTS} попытки: {last}");
+}
+
 /// Поднимает настоящий сервер чата на свободном порту.
 async fn spawn_server() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -39,10 +72,7 @@ async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
     // --- переписка ---
 
     // Адреса берём напрямую: в пределах машины координатор не нужен.
-    let duplex = timeout(PATIENCE, tui::tunnel::connect_to(tunnel.addr()))
-        .await
-        .expect("подключение не уложилось в срок")
-        .expect("не удалось подключиться через туннель");
+    let duplex = dial(&tunnel).await;
 
     // Поверх трубы — обычный WebSocket, тот же, что и по TCP.
     let (mut socket, _) = tokio_tungstenite::client_async("ws://localhost/ws", duplex)

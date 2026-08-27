@@ -21,12 +21,19 @@ pub const DEFAULT_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 pub struct StoredFile {
     pub mime: &'static str,
     pub bytes: Bytes,
+    /// От вида зависит, как файл отдавать: картинку и звук — для показа,
+    /// всё остальное — только для скачивания.
+    pub kind: AttachmentKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaError {
-    TooLarge { size: usize, limit: usize },
-    UnsupportedType,
+    TooLarge {
+        size: usize,
+        limit: usize,
+    },
+    /// Пустой файл: отправлять нечего, а показывать такое вложение — тем более.
+    Empty,
 }
 
 impl fmt::Display for MediaError {
@@ -38,10 +45,7 @@ impl fmt::Display for MediaError {
                 size / 1024,
                 limit / 1024
             ),
-            MediaError::UnsupportedType => write!(
-                f,
-                "поддерживаются картинки (jpeg, png, gif, webp) и звук (webm, ogg, mp4, wav)"
-            ),
+            MediaError::Empty => write!(f, "файл пустой"),
         }
     }
 }
@@ -92,13 +96,16 @@ impl MediaStore {
     /// Тип берётся из содержимого, а не из заголовка запроса: клиент может
     /// назвать байты как угодно, а браузеру потом это исполнять.
     pub fn put(&self, name: &str, bytes: Bytes) -> Result<Attachment, MediaError> {
+        if bytes.is_empty() {
+            return Err(MediaError::Empty);
+        }
         if bytes.len() > validate::MAX_UPLOAD_BYTES {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
                 limit: validate::MAX_UPLOAD_BYTES,
             });
         }
-        let (mime, kind) = sniff(&bytes).ok_or(MediaError::UnsupportedType)?;
+        let (mime, kind) = sniff(&bytes);
 
         let attachment = Attachment {
             id: Uuid::new_v4(),
@@ -115,7 +122,7 @@ impl MediaStore {
             attachment.id,
             Entry {
                 attachment: attachment.clone(),
-                file: StoredFile { mime, bytes },
+                file: StoredFile { mime, bytes, kind },
             },
         );
 
@@ -160,9 +167,9 @@ impl MediaStore {
 /// SVG в списке намеренно нет: это XML, умеющий исполнять скрипты, а раздаём
 /// мы файлы со своего же адреса — картинка от чужого человека получила бы
 /// доступ к странице чата.
-fn sniff(bytes: &[u8]) -> Option<(&'static str, AttachmentKind)> {
-    let image = |mime| Some((mime, AttachmentKind::Image));
-    let audio = |mime| Some((mime, AttachmentKind::Audio));
+fn sniff(bytes: &[u8]) -> (&'static str, AttachmentKind) {
+    let image = |mime| (mime, AttachmentKind::Image);
+    let audio = |mime| (mime, AttachmentKind::Audio);
 
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         image("image/jpeg")
@@ -185,7 +192,11 @@ fn sniff(bytes: &[u8]) -> Option<(&'static str, AttachmentKind)> {
     } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
         audio("audio/wav")
     } else {
-        None
+        // Всё прочее — просто файл. Тип не угадываем: назвать его как-то
+        // конкретно значило бы разрешить браузеру этот файл исполнить, а
+        // раздаётся он с того же адреса, что и сам чат. Поэтому «просто
+        // байты», и отдаём такое вложение только на скачивание.
+        ("application/octet-stream", AttachmentKind::File)
     }
 }
 
@@ -223,16 +234,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_anything_that_is_not_an_image() {
+    fn anything_unrecognized_becomes_a_plain_file() {
         let store = MediaStore::default();
 
-        // Скрипт, притворяющийся картинкой, не должен попасть в хранилище:
-        // отдавали бы мы его со своего же адреса.
+        // Скрипт, притворяющийся картинкой, принять можно — но только как
+        // «просто байты». Назови мы его image/svg+xml, браузер исполнил бы
+        // его на том же адресе, где живёт переписка.
         let script = Bytes::from_static(b"<svg onload=alert(1)></svg>");
-        assert_eq!(
-            store.put("картинка.svg", script),
-            Err(MediaError::UnsupportedType)
-        );
+
+        let attachment = store.put("картинка.svg", script).unwrap();
+
+        assert_eq!(attachment.kind, AttachmentKind::File);
+        assert_eq!(attachment.mime, "application/octet-stream");
+    }
+
+    #[test]
+    fn a_document_keeps_its_name_and_size() {
+        let store = MediaStore::default();
+        let bytes = Bytes::from_static(b"PK archive contents");
+
+        let attachment = store.put("отчёт.zip", bytes.clone()).unwrap();
+
+        assert_eq!(attachment.kind, AttachmentKind::File);
+        assert_eq!(attachment.name, "отчёт.zip");
+        assert_eq!(attachment.size, bytes.len() as u64);
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        let store = MediaStore::default();
+
+        // Пустое вложение показать нечем, а место в ленте оно займёт.
+        assert_eq!(store.put("пусто.bin", Bytes::new()), Err(MediaError::Empty));
         assert!(store.is_empty());
     }
 

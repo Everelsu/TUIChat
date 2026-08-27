@@ -30,6 +30,18 @@ const MAX_SENT: usize = 100;
 const SCROLL_STEP: usize = 10;
 
 pub const HELP: &[&str] = &[
+    // Клавиши идут первыми и без слэшей: тому, кто не пишет код, команда
+    // «/rec» ничего не говорит, а подписанная клавиша на клавиатуре — говорит.
+    "F2 — записать голосовое, повторно отправить",
+    "F3 — послушать последнее голосовое, повторно стоп",
+    "F4 — отправить файл: любой, не только картинку",
+    "F5 — сохранить присланное на диск",
+    "F6 — открыть присланное в системе",
+    "F7 — выбрать любое вложение стрелками, enter открыть",
+    "щелчок по вложению — открыть его",
+    "перетащить файл в окно — отправить его",
+    "F1 — эта справка",
+    "",
     "/join <комната> — перейти в другую комнату",
     "/rooms — показать комнаты на сервере",
     "/nick <ник> — сменить ник",
@@ -255,7 +267,9 @@ pub enum Action {
         result: Result<Vec<FileEntry>, String>,
     },
     /// Голосовое скачано: байты уходят в звук, минуя состояние клиента.
-    Voice(Result<Vec<u8>, String>),
+    Voice(Uuid, Result<Vec<u8>, String>),
+    /// Форма волны разобрана — теперь голосовое рисуется графиком.
+    Waveform(Uuid, crate::media::Waveform),
     /// Сервер поднят прямо здесь: адрес для себя и строки-приглашения.
     Hosted {
         url: String,
@@ -265,6 +279,8 @@ pub enum Action {
     Rooms(Result<Vec<RoomSummary>, String>),
     /// Прокрутка колесом: вверх — положительное число строк.
     Scroll(i32),
+    /// Щелчок мышью по окну: колонка и строка.
+    Click(u16, u16),
     /// Сообщение от самого клиента: сломался ввод, не записался конфиг и т.п.
     Notice(String),
     /// Спокойное сообщение от клиента: адрес для друга, ход дела.
@@ -441,8 +457,9 @@ pub enum Command {
     Upload(std::path::PathBuf),
     /// Прочитать каталог для обзора файлов.
     ReadDir(std::path::PathBuf),
-    /// Скачать и проиграть голосовое.
-    PlayVoice(String),
+    /// Скачать и проиграть голосовое. Идентификатор нужен, чтобы положить
+    /// разобранную форму волны рядом с нужным сообщением.
+    PlayVoice(Uuid, String),
     /// Остановить проигрывание.
     StopVoice,
     /// Начать запись с микрофона или закончить её и отправить.
@@ -457,6 +474,27 @@ pub enum Command {
     /// Записать настройки на диск: ник, комнату и цвета.
     SaveConfig,
     Quit,
+}
+
+/// Зачем сейчас ходят по ленте.
+///
+/// Механизм выбора один и тот же — стрелки и подсветка, — но шагает он по
+/// разным записям: отвечать можно на любую реплику, а проигрывать и сохранять
+/// имеет смысл только то, к чему приложен файл. Иначе до старого голосового
+/// пришлось бы щёлкать через весь разговор.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickMode {
+    /// Ответ: шагаем по всем репликам.
+    Reply,
+    /// Вложение: шагаем только по тем, где есть файл.
+    Attachment,
+}
+
+/// Запись, подсвеченная в ленте, и то, зачем её выбирают.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick {
+    pub index: usize,
+    pub mode: PickMode,
 }
 
 /// Сообщение, на которое сейчас готовится ответ.
@@ -503,6 +541,9 @@ pub struct Completion {
 pub struct Viewport {
     pub height: usize,
     pub total_lines: usize,
+    /// Экранная строка, с которой начинается лента. Нужна, чтобы понять, по
+    /// какому сообщению щёлкнули: координаты мыши считаются от всего окна.
+    pub top: u16,
 }
 
 impl Viewport {
@@ -529,6 +570,16 @@ pub struct State {
     /// Что клиент делает прямо сейчас: качает, отправляет, сохраняет.
     /// Пока не пусто, внизу крутится бегунок.
     pub busy: Option<String>,
+    /// Играет ли сейчас голосовое. Держим в состоянии, чтобы одна и та же
+    /// клавиша умела и включить, и остановить: две клавиши на это — уже
+    /// инструкция, которую надо помнить.
+    pub playing: bool,
+    /// Разобранные формы волн по идентификатору вложения. Появляются после
+    /// скачивания: до него байтов нет, а рисовать выдуманный график нельзя.
+    pub waveforms: HashMap<Uuid, crate::media::Waveform>,
+    /// Какое голосовое играет и когда включили: по этому рисуется бегущая
+    /// заливка графика.
+    pub playing_voice: Option<(Uuid, Instant)>,
     /// Умеет ли терминал настоящую графику. Полублоками миниатюра в несколько
     /// строк превращается в цветной шум, поэтому там остаётся строка с именем.
     pub inline_images: bool,
@@ -546,8 +597,8 @@ pub struct State {
     pub input: Input,
     /// Открытый поиск по истории.
     pub search: Option<Search>,
-    /// Номер записи, которую сейчас выбирают для ответа.
-    pub picking: Option<usize>,
+    /// Запись, которую сейчас выбирают в ленте, и зачем.
+    pub picking: Option<Pick>,
     /// Выбранное сообщение: уйдёт вместе со следующей репликой.
     pub replying: Option<ReplyTarget>,
     /// Номер первой строки каждой записи после последней отрисовки.
@@ -621,6 +672,9 @@ impl State {
             last_dir: None,
             thumbnails: HashMap::new(),
             busy: None,
+            playing: false,
+            waveforms: HashMap::new(),
+            playing_voice: None,
             inline_images: false,
             typing: HashMap::new(),
             typing_sent: None,
@@ -913,6 +967,18 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
             }
             Vec::new()
         }
+        Action::Click(_, row) => {
+            // Щелчок по вложению делает с ним то же, что Enter в выборе:
+            // голосовое играет, картинку открывает, файл кладёт на диск.
+            // По обычной реплике не делаем ничего — случайный клик не должен
+            // ничего менять.
+            match entry_at_row(state, row) {
+                Some(index) if picked_attachment(state, index).is_some() => {
+                    act_on_picked(state, index)
+                }
+                _ => Vec::new(),
+            }
+        }
         Action::Scroll(delta) => {
             scroll_by(state, delta);
             Vec::new()
@@ -942,6 +1008,12 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
                 room: state.room.clone(),
                 server: url,
             }]
+        }
+        Action::Waveform(id, wave) => {
+            state.waveforms.insert(id, wave);
+            // Заливка графика отсчитывается от момента включения.
+            state.playing_voice = Some((id, Instant::now()));
+            Vec::new()
         }
         Action::Rooms(result) => {
             match &mut state.screen {
@@ -1043,7 +1115,7 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
         }
         // Проигрывание — побочный эффект главного цикла: сюда действие
         // доходит, только если звук не смог его перехватить.
-        Action::Voice(_) => Vec::new(),
+        Action::Voice(..) => Vec::new(),
         Action::Net(event) => on_net(state, event),
         Action::Image(id, result) => {
             // Бегунок снимаем, только если ждали именно эту картинку: фоновые
@@ -1214,6 +1286,55 @@ fn login_submit(state: &mut State) -> Vec<Command> {
         room,
         server,
     }]
+}
+
+/// Похоже ли на путь к файлу, а не на обычную реплику.
+///
+/// Проверка нарочно грубая: настоящий ответ даёт файловая система, а это
+/// лишь отсев, чтобы не дёргать диск на каждое сообщение.
+fn looks_like_path(value: &str) -> bool {
+    // Пробелы в пути бывают, а вот перевод строки — уже точно не путь.
+    if value.contains('\n') {
+        return false;
+    }
+    // Windows: «C:\…». Остальные: «/…» или «~/…».
+    let windows = value.len() > 3
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'\\' | b'/')
+        && value.as_bytes()[0].is_ascii_alphabetic();
+    windows || value.starts_with('/') || value.starts_with("~/") || value.starts_with(r"\\")
+}
+
+/// Какому сообщению принадлежит экранная строка.
+///
+/// Мышь знает только координаты окна, а лента к моменту щелчка уже разложена
+/// по строкам и прокручена, поэтому пересчёт возможен только здесь.
+fn entry_at_row(state: &State, row: u16) -> Option<usize> {
+    let top = state.viewport.top;
+    let height = state.viewport.height;
+    if row < top || height == 0 {
+        return None;
+    }
+    let offset = (row - top) as usize;
+    if offset >= height {
+        return None;
+    }
+
+    // Лента прижата к низу: видно последние `height` строк за вычетом того,
+    // на сколько прокрутили вверх.
+    let end = state.viewport.total_lines.saturating_sub(state.scrollback);
+    let start = end.saturating_sub(height);
+    let line = start + offset;
+    if line >= end {
+        return None;
+    }
+
+    // Запись, чья первая строка ближе всего сверху.
+    state
+        .entry_lines
+        .iter()
+        .rposition(|first| *first <= line)
+        .filter(|index| *index < state.entries.len())
 }
 
 /// Прокручивает историю: положительное число строк — вверх, к прошлому.
@@ -1438,37 +1559,77 @@ fn on_search_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
 }
 
 /// Соседняя реплика: системные строки при выборе ответа пропускаются.
-fn neighbour_chat(state: &State, from: usize, direction: i32) -> Option<usize> {
+/// Годится ли запись для выбора в этом режиме.
+fn suits(entry: &Entry, mode: PickMode) -> bool {
+    match (entry, mode) {
+        (Entry::Chat { .. }, PickMode::Reply) => true,
+        (Entry::Chat { attachment, .. }, PickMode::Attachment) => attachment.is_some(),
+        (Entry::System { .. }, _) => false,
+    }
+}
+
+fn neighbour_chat(state: &State, from: usize, direction: i32, mode: PickMode) -> Option<usize> {
     let mut index = from as i64;
     loop {
         index += i64::from(direction);
         if index < 0 || index as usize >= state.entries.len() {
             return None;
         }
-        if matches!(state.entries[index as usize], Entry::Chat { .. }) {
+        if suits(&state.entries[index as usize], mode) {
             return Some(index as usize);
         }
     }
 }
 
-fn last_chat(state: &State) -> Option<usize> {
-    state
-        .entries
-        .iter()
-        .rposition(|entry| matches!(entry, Entry::Chat { .. }))
+fn last_chat(state: &State, mode: PickMode) -> Option<usize> {
+    state.entries.iter().rposition(|entry| suits(entry, mode))
 }
 
 /// Начинает выбор сообщения для ответа или подтверждает выбранное.
 fn toggle_picking(state: &mut State) {
     match state.picking.take() {
-        Some(index) => confirm_reply(state, index),
-        None => {
-            state.picking = last_chat(state);
-            if state.picking.is_none() {
-                state.system(SystemKind::Error, "отвечать пока не на что");
-            }
-            reveal_entry(state, state.picking);
-        }
+        // Повторное нажатие подтверждает выбранное — но только если ходили
+        // за ответом: у вложений своё действие, и молча отвечать на них
+        // вместо проигрывания было бы неожиданно.
+        Some(pick) if pick.mode == PickMode::Reply => confirm_reply(state, pick.index),
+        Some(_) => start_picking(state, PickMode::Reply),
+        None => start_picking(state, PickMode::Reply),
+    }
+}
+
+/// Начинает ходить по ленте: подсвечивает последнюю подходящую запись.
+fn start_picking(state: &mut State, mode: PickMode) {
+    let Some(index) = last_chat(state, mode) else {
+        let reason = match mode {
+            PickMode::Reply => "отвечать пока не на что",
+            PickMode::Attachment => "в этой комнате пока нет вложений",
+        };
+        state.picking = None;
+        state.system(SystemKind::Error, reason);
+        return;
+    };
+    state.picking = Some(Pick { index, mode });
+    reveal_entry(state, Some(index));
+}
+
+/// Вложение выбранной записи.
+fn picked_attachment(state: &State, index: usize) -> Option<Attachment> {
+    match state.entries.get(index) {
+        Some(Entry::Chat { attachment, .. }) => attachment.clone(),
+        _ => None,
+    }
+}
+
+/// Делает с выбранным вложением то, чего от него и ждут: картинку показывает,
+/// голосовое проигрывает, остальное кладёт на диск.
+fn act_on_picked(state: &mut State, index: usize) -> Vec<Command> {
+    let Some(attachment) = picked_attachment(state, index) else {
+        return Vec::new();
+    };
+    match attachment.kind {
+        AttachmentKind::Image => view_attachment(state, attachment),
+        AttachmentKind::Audio => play_attachment(state, attachment),
+        AttachmentKind::File => save_attachment(state, attachment, ""),
     }
 }
 
@@ -1545,31 +1706,58 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
 
     // Выбор сообщения для ответа перехватывает стрелки и Enter: пока он открыт,
     // они значат «другое сообщение» и «это оно».
-    if let Some(index) = state.picking {
+    if let Some(Pick { index, mode }) = state.picking {
+        // Подтверждение делает то, зачем выбор и открывали: ответ — цитирует,
+        // вложение — показывает, проигрывает или кладёт на диск.
+        let confirm = |state: &mut State| -> Vec<Command> {
+            state.picking = None;
+            match mode {
+                PickMode::Reply => {
+                    confirm_reply(state, index);
+                    Vec::new()
+                }
+                PickMode::Attachment => act_on_picked(state, index),
+            }
+        };
+
         match key.code {
             KeyCode::Esc => state.picking = None,
             KeyCode::Char('c' | 'd') if ctrl => {
                 state.should_quit = true;
                 return vec![Command::Quit];
             }
-            KeyCode::Enter => {
-                state.picking = None;
-                confirm_reply(state, index);
-            }
+            KeyCode::Enter => return confirm(state),
             // Повторный Ctrl+R подтверждает выбор — так же, как Enter.
-            KeyCode::Char('r') if ctrl => {
+            KeyCode::Char('r') if ctrl => return confirm(state),
+            // Пока ходим по вложениям, действие можно назвать и явно:
+            // картинку иногда нужно не посмотреть, а сохранить.
+            KeyCode::F(3) if mode == PickMode::Attachment => {
                 state.picking = None;
-                confirm_reply(state, index);
+                if let Some(attachment) = picked_attachment(state, index) {
+                    return play_attachment(state, attachment);
+                }
+            }
+            KeyCode::F(5) if mode == PickMode::Attachment => {
+                state.picking = None;
+                if let Some(attachment) = picked_attachment(state, index) {
+                    return save_attachment(state, attachment, "");
+                }
+            }
+            KeyCode::F(6) if mode == PickMode::Attachment => {
+                state.picking = None;
+                if let Some(attachment) = picked_attachment(state, index) {
+                    return open_attachment(state, attachment);
+                }
             }
             KeyCode::Up => {
-                if let Some(next) = neighbour_chat(state, index, -1) {
-                    state.picking = Some(next);
+                if let Some(next) = neighbour_chat(state, index, -1, mode) {
+                    state.picking = Some(Pick { index: next, mode });
                     reveal_entry(state, Some(next));
                 }
             }
             KeyCode::Down => {
-                if let Some(next) = neighbour_chat(state, index, 1) {
-                    state.picking = Some(next);
+                if let Some(next) = neighbour_chat(state, index, 1, mode) {
+                    state.picking = Some(Pick { index: next, mode });
                     reveal_entry(state, Some(next));
                 }
             }
@@ -1594,6 +1782,35 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         // Отдельная клавиша для файла: набирать «/send» ради выбора картинки
         // всё-таки лишний шаг.
         KeyCode::Char('o') if ctrl => return send_command(state, ""),
+
+        // Функциональный ряд — для тех, кто не собирается учить команды.
+        // Всё, ради чего люди открывают чат, должно делаться одной подписанной
+        // клавишей, а не строкой, начинающейся со слэша.
+        KeyCode::F(1) => {
+            state.help = true;
+            return Vec::new();
+        }
+        // Одна клавиша на запись и отправку: во время записи всё равно ничем
+        // другим не занят, а помнить две — лишнее.
+        KeyCode::F(2) => return vec![Command::ToggleRecording],
+        // Играет — остановить, не играет — включить последнее голосовое.
+        KeyCode::F(3) => {
+            return if state.playing {
+                vec![Command::StopVoice]
+            } else {
+                play_command(state)
+            };
+        }
+        KeyCode::F(4) => return send_command(state, ""),
+        // Ходьба по вложениям: стрелки прыгают только по ним, поэтому до
+        // старого голосового или фотографии не приходится щёлкать через
+        // весь разговор.
+        KeyCode::F(7) => {
+            start_picking(state, PickMode::Attachment);
+            return Vec::new();
+        }
+        KeyCode::F(5) => return save_command(state, ""),
+        KeyCode::F(6) => return open_command(state),
         // Пока ответ взведён, Esc снимает его, а не выходит из программы.
         KeyCode::Esc if state.replying.is_some() => {
             state.replying = None;
@@ -1652,6 +1869,20 @@ fn submit(state: &mut State) -> Vec<Command> {
         state.remember_sent(&line);
         state.input.clear();
         return run_command(state, &line);
+    }
+
+    // Перетащенный в окно файл вставляется как путь, и человек жмёт Enter,
+    // ожидая, что файл уйдёт. Отправлять вместо него строку с путём —
+    // бесполезно: на том конце её открыть нечем. Поэтому строка, которая
+    // целиком является путём к существующему файлу, отправляется файлом.
+    let dropped = line.trim().trim_matches(['"', '\'']).trim();
+    if !dropped.is_empty() && looks_like_path(dropped) {
+        let path = std::path::PathBuf::from(dropped);
+        if path.is_file() {
+            state.remember_sent(&line);
+            state.input.clear();
+            return send_command(state, dropped);
+        }
     }
 
     let body = line.strip_prefix('/').map_or(line.clone(), str::to_string);
@@ -1741,10 +1972,17 @@ fn attachment_url(state: &State, attachment: &Attachment) -> Option<String> {
 
 /// Показывает последнюю картинку прямо в переписке.
 fn view_command(state: &mut State) -> Vec<Command> {
-    let Some(attachment) = last_attachment(state) else {
-        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
-        return Vec::new();
-    };
+    match last_attachment(state) {
+        Some(attachment) => view_attachment(state, attachment),
+        None => {
+            state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+            Vec::new()
+        }
+    }
+}
+
+/// Показывает конкретную картинку — последнюю или выбранную в ленте.
+fn view_attachment(state: &mut State, attachment: Attachment) -> Vec<Command> {
     if attachment.kind != AttachmentKind::Image {
         state.system(
             SystemKind::Error,
@@ -1772,10 +2010,16 @@ fn view_command(state: &mut State) -> Vec<Command> {
 /// Терминал картинку не покажет, а полный адрес в ленте рвётся переносом и
 /// становится бесполезным, поэтому открываем сами.
 fn open_command(state: &mut State) -> Vec<Command> {
-    let Some(attachment) = last_attachment(state) else {
-        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
-        return Vec::new();
-    };
+    match last_attachment(state) {
+        Some(attachment) => open_attachment(state, attachment),
+        None => {
+            state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+            Vec::new()
+        }
+    }
+}
+
+fn open_attachment(state: &mut State, attachment: Attachment) -> Vec<Command> {
     let Some(url) = attachment_url(state, &attachment) else {
         state.system(SystemKind::Error, "неизвестен адрес сервера");
         return Vec::new();
@@ -1787,12 +2031,19 @@ fn open_command(state: &mut State) -> Vec<Command> {
 
 /// Проигрывает последнее голосовое.
 fn play_command(state: &mut State) -> Vec<Command> {
-    let Some(attachment) = last_attachment(state) else {
-        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
-        return Vec::new();
-    };
+    match last_attachment(state) {
+        Some(attachment) => play_attachment(state, attachment),
+        None => {
+            state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+            Vec::new()
+        }
+    }
+}
+
+/// Проигрывает конкретное голосовое — последнее или выбранное в ленте.
+fn play_attachment(state: &mut State, attachment: Attachment) -> Vec<Command> {
     if attachment.kind != AttachmentKind::Audio {
-        state.system(SystemKind::Error, "последнее вложение — не голосовое");
+        state.system(SystemKind::Error, "это вложение — не голосовое");
         return Vec::new();
     }
     let Some(url) = attachment_url(state, &attachment) else {
@@ -1801,15 +2052,22 @@ fn play_command(state: &mut State) -> Vec<Command> {
     };
 
     state.busy = Some(format!("качаю {}", attachment.name));
-    vec![Command::PlayVoice(url)]
+    vec![Command::PlayVoice(attachment.id, url)]
 }
 
 /// Сохраняет последнее вложение на диск.
 fn save_command(state: &mut State, arg: &str) -> Vec<Command> {
-    let Some(attachment) = last_attachment(state) else {
-        state.system(SystemKind::Error, "в этой комнате пока нет вложений");
-        return Vec::new();
-    };
+    match last_attachment(state) {
+        Some(attachment) => save_attachment(state, attachment, arg),
+        None => {
+            state.system(SystemKind::Error, "в этой комнате пока нет вложений");
+            Vec::new()
+        }
+    }
+}
+
+/// Кладёт на диск конкретное вложение — последнее или выбранное в ленте.
+fn save_attachment(state: &mut State, attachment: Attachment, arg: &str) -> Vec<Command> {
     let Some(url) = attachment_url(state, &attachment) else {
         state.system(SystemKind::Error, "неизвестен адрес сервера");
         return Vec::new();
@@ -2578,6 +2836,326 @@ mod tests {
         assert_eq!(login.rooms_note.as_deref(), Some("сервер не ответил"));
     }
 
+    fn function(n: u8) -> Action {
+        Action::Key(KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn function_keys_do_what_the_commands_do() {
+        // Смысл клавиш ровно в том, чтобы не заставлять человека помнить
+        // команды: F2 должна делать то же, что «/rec».
+        let (mut state, _) = connected();
+
+        assert_eq!(
+            update(&mut state, function(2)),
+            vec![Command::ToggleRecording]
+        );
+
+        // F1 открывает справку, а не пишет что-то в комнату.
+        let (mut state, _) = connected();
+        let before = state.entries.len();
+        assert!(update(&mut state, function(1)).is_empty());
+        assert!(state.help, "F1 не открыла справку");
+        assert_eq!(state.entries.len(), before);
+    }
+
+    #[test]
+    fn f4_opens_the_file_browser() {
+        let (mut state, _) = connected();
+        // Отправка требует известного адреса сервера — иначе некуда лить.
+        state.media_base = "http://127.0.0.1:8080".into();
+
+        let commands = update(&mut state, function(4));
+
+        assert!(state.browser.is_some(), "обзор файлов не открылся");
+        assert!(
+            matches!(commands.as_slice(), [Command::ReadDir(_)]),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn f3_plays_and_then_stops() {
+        let (mut state, _) = with_voice();
+
+        // Ничего не играет — F3 включает.
+        let commands = update(&mut state, function(3));
+        assert!(
+            matches!(commands.as_slice(), [Command::PlayVoice(..)]),
+            "{commands:?}"
+        );
+
+        // Играет — та же клавиша останавливает: две клавиши на это уже
+        // инструкция, которую надо помнить.
+        state.playing = true;
+        assert_eq!(update(&mut state, function(3)), vec![Command::StopVoice]);
+    }
+
+    #[test]
+    fn function_keys_do_not_leak_into_the_message() {
+        // Незнакомая клавиша не должна оказаться символом в строке ввода.
+        let (mut state, _) = connected();
+        typed(&mut state, "привет");
+
+        update(&mut state, function(2));
+
+        assert_eq!(state.input.text, "привет");
+    }
+
+    /// Комната с картинкой, голосовым и обычной репликой между ними.
+    fn with_mixed_attachments() -> State {
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+
+        let picture = Attachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Image,
+            name: "кот.png".into(),
+            size: 10,
+            mime: "image/png".into(),
+        };
+        let voice = Attachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Audio,
+            name: "голосовое.wav".into(),
+            size: 20,
+            mime: "audio/wav".into(),
+        };
+        for attachment in [Some(picture), None, Some(voice), None] {
+            let mut message = chat_message(user("bob"), "текст");
+            message.attachment = attachment;
+            update(
+                &mut state,
+                Action::Net(NetEvent::Message(ServerMessage::Chat(message))),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn f7_walks_only_over_messages_with_attachments() {
+        // Ради этого всё и затевалось: до старого голосового не должно
+        // приходиться щёлкать через весь разговор.
+        let mut state = with_mixed_attachments();
+
+        update(&mut state, function(7));
+        let first = state.picking.expect("выбор не начался");
+        assert_eq!(first.mode, PickMode::Attachment);
+        assert!(
+            picked_attachment(&state, first.index).is_some(),
+            "выбрана запись без вложения"
+        );
+
+        // Шаг вверх обязан перескочить обычную реплику и попасть на картинку.
+        update(&mut state, key(KeyCode::Up));
+        let second = state.picking.expect("выбор потерялся");
+        assert!(second.index < first.index);
+        let attachment = picked_attachment(&state, second.index).expect("нет вложения");
+        assert_eq!(attachment.kind, AttachmentKind::Image);
+    }
+
+    #[test]
+    fn enter_does_the_natural_thing_to_the_picked_attachment() {
+        let mut state = with_mixed_attachments();
+
+        // Последнее вложение — голосовое: Enter должен его проиграть.
+        update(&mut state, function(7));
+        let commands = update(&mut state, key(KeyCode::Enter));
+        assert!(
+            matches!(commands.as_slice(), [Command::PlayVoice(..)]),
+            "{commands:?}"
+        );
+        assert!(state.picking.is_none(), "выбор не закрылся");
+
+        // А картинку — показать.
+        update(&mut state, function(7));
+        update(&mut state, key(KeyCode::Up));
+        let commands = update(&mut state, key(KeyCode::Enter));
+        assert!(
+            matches!(commands.as_slice(), [Command::Fetch(..)]),
+            "{commands:?}"
+        );
+        assert!(state.viewer.is_some(), "просмотр не открылся");
+    }
+
+    #[test]
+    fn a_picked_picture_can_be_saved_instead_of_shown() {
+        // Картинку иногда нужно не посмотреть, а положить на диск.
+        let mut state = with_mixed_attachments();
+        update(&mut state, function(7));
+        update(&mut state, key(KeyCode::Up));
+
+        let commands = update(&mut state, function(5));
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Save { destination, .. }]
+                    if destination.ends_with("кот.png")
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn picking_an_attachment_does_not_start_a_reply() {
+        // Режимы не должны путаться: Ctrl+R цитирует, F7 — открывает.
+        let mut state = with_mixed_attachments();
+
+        update(&mut state, function(7));
+        update(&mut state, key(KeyCode::Enter));
+
+        assert!(state.replying.is_none(), "вложение превратилось в цитату");
+    }
+
+    #[test]
+    fn reply_picking_still_walks_every_message() {
+        // Старое поведение не должно пострадать: отвечать можно на любую
+        // реплику, не только на ту, где есть файл.
+        let mut state = with_mixed_attachments();
+
+        update(&mut state, ctrl('r'));
+        let pick = state.picking.expect("выбор не начался");
+        assert_eq!(pick.mode, PickMode::Reply);
+        // Последняя реплика — без вложения, и она годится для ответа.
+        assert!(picked_attachment(&state, pick.index).is_none());
+
+        update(&mut state, key(KeyCode::Enter));
+        assert!(state.replying.is_some(), "цитата не взведена");
+    }
+
+    #[test]
+    fn a_path_is_told_apart_from_a_message() {
+        // Отсев грубый, но обязан пропускать то, что вставляет проводник,
+        // и не трогать обычную речь.
+        assert!(looks_like_path(r"C:\Users\egord\Downloads\голосовое.wav"));
+        assert!(looks_like_path("C:/Users/egord/фото.png"));
+        assert!(looks_like_path("/home/egor/фото.png"));
+        assert!(looks_like_path(r"\\сервер\общая\файл.zip"));
+
+        for message in [
+            "привет",
+            "смотри что нашёл",
+            "1:2 счёт",
+            r"путь C:\тут внутри фразы",
+        ] {
+            assert!(!looks_like_path(message), "принято за путь: {message}");
+        }
+    }
+
+    #[test]
+    fn a_dragged_file_is_sent_as_a_file_not_as_text() {
+        // Перетаскивание в терминал вставляет путь. Отправить его строкой —
+        // бесполезно: открыть её на том конце нечем.
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+
+        let file = std::env::current_exe().expect("нет пути к своему же exe");
+        let typed_path = file.to_string_lossy().to_string();
+        typed(&mut state, &typed_path);
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(
+            matches!(commands.as_slice(), [Command::Upload(path)] if *path == file),
+            "{commands:?}"
+        );
+        assert!(state.input.is_empty(), "ввод не очистился");
+    }
+
+    #[test]
+    fn a_path_to_nothing_stays_an_ordinary_message() {
+        // Несуществующий путь — просто текст: молча проглотить сообщение
+        // было бы хуже, чем отправить его как есть.
+        let (mut state, _) = connected();
+        state.media_base = "http://127.0.0.1:8080".into();
+        typed(&mut state, r"C:\такого\файла\нет.txt");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Send(ClientMessage::Chat { .. })]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_voice_plays_it() {
+        // Щелчок по голосовому — самый очевидный жест, который только может
+        // быть: график нарисован, по нему и щёлкают.
+        let mut state = with_mixed_attachments();
+        // Раскладка ленты известна только после отрисовки, поэтому в тесте
+        // задаём её руками: по строке на запись, лента с самого верха окна.
+        state.entry_lines = (0..state.entries.len()).collect();
+        state.viewport = Viewport {
+            height: state.entries.len(),
+            total_lines: state.entries.len(),
+            top: 0,
+        };
+        state.scrollback = 0;
+
+        // Последняя запись — реплика без вложения, перед ней голосовое.
+        let voice_row = (state.entries.len() - 2) as u16;
+        let commands = update(&mut state, Action::Click(0, voice_row));
+
+        assert!(
+            matches!(commands.as_slice(), [Command::PlayVoice(..)]),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_plain_message_does_nothing() {
+        // Случайный щелчок не должен ничего менять: в чате мышью попадают
+        // мимо постоянно.
+        let mut state = with_mixed_attachments();
+        state.entry_lines = (0..state.entries.len()).collect();
+        state.viewport = Viewport {
+            height: state.entries.len(),
+            total_lines: state.entries.len(),
+            top: 0,
+        };
+
+        let last = (state.entries.len() - 1) as u16;
+        let commands = update(&mut state, Action::Click(0, last));
+
+        assert!(commands.is_empty(), "{commands:?}");
+        assert!(state.viewer.is_none());
+    }
+
+    #[test]
+    fn clicking_outside_the_feed_is_ignored() {
+        let mut state = with_mixed_attachments();
+        state.entry_lines = (0..state.entries.len()).collect();
+        state.viewport = Viewport {
+            height: 3,
+            total_lines: state.entries.len(),
+            top: 5,
+        };
+
+        // Выше ленты и ниже неё — мимо.
+        assert!(update(&mut state, Action::Click(0, 1)).is_empty());
+        assert!(update(&mut state, Action::Click(0, 99)).is_empty());
+    }
+
+    #[test]
+    fn f7_without_attachments_explains_itself() {
+        let (mut state, _) = connected();
+
+        update(&mut state, function(7));
+
+        assert!(state.picking.is_none());
+        assert!(matches!(
+            state.entries.last(),
+            Some(Entry::System {
+                kind: SystemKind::Error,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn join_command_switches_rooms_and_forgets_the_old_one() {
         let (mut state, _) = connected();
@@ -2806,6 +3384,7 @@ mod tests {
         state.viewport = Viewport {
             height: 10,
             total_lines: 40,
+            top: 0,
         };
         state.entry_lines = (0..state.entries.len()).map(|index| index * 2).collect();
         state
@@ -2816,7 +3395,7 @@ mod tests {
         let mut state = with_history();
 
         update(&mut state, ctrl('r'));
-        let picked = state.picking.expect("выбор не начался");
+        let picked = state.picking.expect("выбор не начался").index;
         update(&mut state, key(KeyCode::Enter));
 
         let target = state.replying.clone().expect("цитата не взведена");
@@ -2843,13 +3422,13 @@ mod tests {
     fn arrows_walk_through_messages_while_picking() {
         let mut state = with_history();
         update(&mut state, ctrl('r'));
-        let last = state.picking.unwrap();
+        let last = state.picking.unwrap().index;
 
         update(&mut state, key(KeyCode::Up));
-        assert!(state.picking.unwrap() < last, "вверх не сработало");
+        assert!(state.picking.unwrap().index < last, "вверх не сработало");
 
         update(&mut state, key(KeyCode::Down));
-        assert_eq!(state.picking, Some(last));
+        assert_eq!(state.picking.map(|pick| pick.index), Some(last));
     }
 
     #[test]
@@ -2859,7 +3438,7 @@ mod tests {
         update(&mut state, ctrl('r'));
 
         // Системная строка — не сообщение, отвечать на неё нечего.
-        let picked = state.picking.expect("выбор не начался");
+        let picked = state.picking.expect("выбор не начался").index;
         assert!(matches!(state.entries[picked], Entry::Chat { .. }));
     }
 
@@ -3439,9 +4018,10 @@ mod tests {
 
         assert_eq!(
             commands,
-            [Command::PlayVoice(format!(
-                "http://127.0.0.1:8080/media/{id}"
-            ))]
+            [Command::PlayVoice(
+                id,
+                format!("http://127.0.0.1:8080/media/{id}")
+            )]
         );
     }
 
@@ -3570,7 +4150,7 @@ mod tests {
             path: std::path::PathBuf::from(format!("C:/фото/{name}")),
             is_dir,
             size: 1024,
-            supported: !is_dir,
+            media: !is_dir,
         }
     }
 
@@ -3992,6 +4572,7 @@ mod tests {
         state.viewport = Viewport {
             height: 10,
             total_lines: 40,
+            top: 0,
         };
 
         update(&mut state, Action::Scroll(3));
@@ -4011,6 +4592,7 @@ mod tests {
         state.viewport = Viewport {
             height: 10,
             total_lines: 15,
+            top: 0,
         };
 
         for _ in 0..5 {
