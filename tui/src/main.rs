@@ -20,7 +20,7 @@ use tui::{
     config::Config,
     host::{self, Hosted},
     images::Images,
-    media,
+    launcher, media,
     net::{self, NetConfig, NetHandle},
     sound::Sound,
     ui,
@@ -45,6 +45,10 @@ struct Args {
     /// Порт для `--host`.
     #[arg(long, default_value_t = 8080)]
     port: u16,
+    /// Перезапускать ли клиент в нормальном терминале: `auto` — только после
+    /// двойного клика, `always` — из любого старого окна, `never` — никогда.
+    #[arg(long)]
+    terminal: Option<String>,
 }
 
 #[tokio::main]
@@ -53,6 +57,20 @@ async fn main() -> io::Result<()> {
     // Настройки — это значения по умолчанию, аргументы командной строки их
     // перекрывают: запуск с чужим ником не должен ничего перетирать до входа.
     let config = Config::load();
+
+    // Перезапуск в нормальном терминале — самое первое дело: интерфейс,
+    // собранный из цвета и полублоков, в conhost выглядит сломанным, и
+    // человек решает, что сломана программа. Уходим до всякой подготовки,
+    // чтобы не оставлять за собой ни поднятого сервера, ни raw-режима.
+    let terminal_mode = args
+        .terminal
+        .as_deref()
+        .or(Some(config.terminal.as_str()))
+        .and_then(launcher::Mode::parse)
+        .unwrap_or_default();
+    if launcher::relaunch_if_needed(terminal_mode) {
+        return Ok(());
+    }
     let server = args.server.unwrap_or_else(|| config.server.clone());
     let room_arg = args.room.unwrap_or_else(|| config.room.clone());
     // Ник из аргументов означает «войти сразу», из настроек — только
@@ -174,7 +192,7 @@ async fn run(
     let (actions, mut incoming) = unbounded_channel();
     spawn_input(actions.clone());
 
-    let (mut state, startup) = State::new(nickname, room);
+    let (mut state, mut startup) = State::new(nickname, room);
     if let Some(remembered) = &remembered {
         state.prefill_nickname(remembered);
     }
@@ -201,6 +219,12 @@ async fn run(
         for line in hosted.invitations() {
             let _ = actions.send(Action::Info(line));
         }
+    }
+
+    // На экране входа сразу тянем список комнат: человек видит, куда можно
+    // зайти, ещё до того, как что-то введёт.
+    if matches!(state.screen, tui::app::Screen::Login(_)) {
+        startup.push(Command::FetchRooms(state.media_base.clone()));
     }
 
     let mut network: Option<NetHandle> = None;
@@ -290,6 +314,7 @@ fn apply(
                 }
             }
             Command::Host(port) => host_here(port, actions.clone()),
+            Command::FetchRooms(base) => fetch_rooms(base, actions.clone()),
             Command::Connect {
                 nickname,
                 room,
@@ -424,6 +449,26 @@ fn host_here(port: u16, actions: UnboundedSender<Action>) {
                 )));
             }
         }
+    });
+}
+
+/// Спрашивает у сервера список комнат для экрана входа.
+///
+/// Обычный `GET /rooms` по тому же http, что и вложения. Ошибку не прячем —
+/// человеку показывается, почему список пуст (сервер не поднят, чужой адрес,
+/// https), а вход это всё равно не блокирует.
+fn fetch_rooms(base: String, actions: UnboundedSender<Action>) {
+    tokio::spawn(async move {
+        let url = format!("{}/rooms", base.trim_end_matches('/'));
+        let work = tokio::task::spawn_blocking(move || {
+            let bytes = media::fetch(&url)?;
+            serde_json::from_slice::<Vec<common::RoomSummary>>(&bytes)
+                .map_err(|err| format!("сервер ответил не списком комнат: {err}"))
+        });
+        let result = work
+            .await
+            .unwrap_or_else(|err| Err(format!("запрос комнат сорвался: {err}")));
+        let _ = actions.send(Action::Rooms(result));
     });
 }
 

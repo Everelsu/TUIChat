@@ -1049,3 +1049,64 @@ async fn typing_storm_is_throttled() {
     }
     assert_eq!(typings, 1, "лавина «печатает» прошла насквозь");
 }
+
+/// http-адрес `GET /rooms` из ws-адреса, на котором поднят сервер в тесте.
+async fn get_rooms(ws_url: &str) -> Vec<common::RoomSummary> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let authority = ws_url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/ws")
+        .to_string();
+    let mut stream = TcpStream::connect(&authority).await.unwrap();
+    let request =
+        format!("GET /rooms HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("нет разделителя заголовка");
+    let head = String::from_utf8_lossy(&response[..separator]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    serde_json::from_slice(&response[separator + 4..]).expect("тело — не список комнат")
+}
+
+#[tokio::test]
+async fn rooms_endpoint_lists_active_rooms_with_counts() {
+    let url = spawn().await;
+
+    // Пустой сервер — пустой список: показывать нечего, и это не ошибка.
+    assert!(get_rooms(&url).await.is_empty());
+
+    let mut alice = connect(&url).await;
+    try_join(&mut alice, "alice", "rust").await;
+    let mut bob = connect(&url).await;
+    try_join(&mut bob, "bob", "rust").await;
+    let mut carol = connect(&url).await;
+    try_join(&mut carol, "carol", "talk").await;
+
+    let mut rooms = get_rooms(&url).await;
+    rooms.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(rooms.len(), 2, "{rooms:?}");
+    assert_eq!(rooms[0].name, "rust");
+    assert_eq!(rooms[0].users, 2);
+    assert_eq!(rooms[1].name, "talk");
+    assert_eq!(rooms[1].users, 1);
+}
+
+#[tokio::test]
+async fn rooms_endpoint_drops_empty_rooms() {
+    let url = spawn().await;
+
+    let mut alice = connect(&url).await;
+    try_join(&mut alice, "alice", "rust").await;
+    // Уходит последний — комната исчезает из списка, а не висит пустой.
+    send(&mut alice, &ClientMessage::Leave).await;
+    drop(alice);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(get_rooms(&url).await.is_empty());
+}

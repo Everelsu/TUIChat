@@ -27,6 +27,8 @@ const ui = {
   nickname: el("nickname"),
   room: el("room"),
   joinError: el("join-error"),
+  rooms: el("rooms"),
+  roomsList: el("rooms-list"),
   chat: el("chat"),
   roomName: el("room-name"),
   people: el("people"),
@@ -489,6 +491,9 @@ function showJoinScreen(error) {
   ui.room.value = state.room || ui.room.value;
   ui.nickname.focus();
   ui.nickname.select();
+  // Вернулись на вход — освежаем список: за время в чате комнаты могли
+  // появиться или опустеть.
+  loadRooms();
 }
 
 /// Ник и комната запоминаются: на телефоне вводить их заново при каждом
@@ -522,6 +527,55 @@ function restore() {
   if (saved.alerts) setAlerts(true);
   const room = fromUrl || saved.room;
   if (room) ui.room.value = room;
+  loadRooms();
+}
+
+/// Тянет список живущих комнат и показывает их на экране входа. Список —
+/// удобство: не вышло получить — молча прячем, вход это не ломает.
+async function loadRooms() {
+  if (!ui.rooms) return;
+  try {
+    const response = await fetch("/rooms", { cache: "no-store" });
+    if (!response.ok) throw new Error(String(response.status));
+    renderRooms(await response.json());
+  } catch {
+    ui.rooms.hidden = true;
+  }
+}
+
+function renderRooms(rooms) {
+  ui.roomsList.replaceChildren();
+  if (!Array.isArray(rooms) || rooms.length === 0) {
+    ui.rooms.hidden = true;
+    return;
+  }
+  for (const room of rooms) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "room-pick";
+
+    const name = document.createElement("span");
+    name.className = "room-pick-name";
+    // textContent, не innerHTML: имя пришло с сервера, но пусть подделать
+    // разметку через него будет нечем.
+    name.textContent = room.name;
+
+    const count = document.createElement("span");
+    count.className = "room-pick-count";
+    count.textContent = room.users === 1 ? "1 чел." : `${room.users} чел.`;
+
+    button.append(name, count);
+    // Тап подставляет комнату в поле — заходить решает человек кнопкой «Войти».
+    button.addEventListener("click", () => {
+      ui.room.value = room.name;
+      ui.nickname.focus();
+    });
+
+    const item = document.createElement("li");
+    item.append(button);
+    ui.roomsList.append(item);
+  }
+  ui.rooms.hidden = false;
 }
 
 ui.join.addEventListener("submit", (event) => {

@@ -28,6 +28,10 @@ pub struct Config {
     /// Показывать ли картинки прямо в переписке. `None` — решает клиент по
     /// возможностям терминала: в sixel лента от них заметно тормозит.
     pub inline_images: Option<bool>,
+    /// Перезапускать ли клиент в нормальном терминале: `auto` — только после
+    /// двойного клика, `always` — из любого несовременного окна, `never` —
+    /// никогда. Подробности — в `launcher`.
+    pub terminal: String,
     /// Цвета ников: ключ — ник в нижнем регистре, значение — `#rrggbb`
     /// или название вроде `cyan`.
     pub colors: BTreeMap<String, String>,
@@ -41,6 +45,7 @@ impl Default for Config {
             room: "general".to_string(),
             last_dir: None,
             inline_images: None,
+            terminal: "auto".to_string(),
             colors: BTreeMap::new(),
         }
     }

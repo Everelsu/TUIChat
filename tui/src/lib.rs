@@ -9,6 +9,7 @@ pub mod config;
 pub mod files;
 pub mod host;
 pub mod images;
+pub mod launcher;
 pub mod media;
 pub mod net;
 pub mod sound;

@@ -11,7 +11,7 @@ use std::{
 
 use common::{
     Attachment, AttachmentKind, ChatMessage, ClientMessage, REPLY_EXCERPT_CHARS, ReplyPreview,
-    ServerMessage, UserInfo, validate,
+    RoomSummary, ServerMessage, UserInfo, validate,
 };
 use image::RgbImage;
 use ratatui::style::Color;
@@ -31,6 +31,7 @@ const SCROLL_STEP: usize = 10;
 
 pub const HELP: &[&str] = &[
     "/join <комната> — перейти в другую комнату",
+    "/rooms — показать комнаты на сервере",
     "/nick <ник> — сменить ник",
     "/send [путь] — отправить файл, без пути — выбрать",
     "/view — показать картинку в терминале",
@@ -46,9 +47,9 @@ pub const HELP: &[&str] = &[
 ];
 
 /// Команды для дополнения по Tab. Порядок — как в справке.
-const COMMANDS: [&str; 14] = [
-    "/help", "/join", "/nick", "/send", "/view", "/play", "/stop", "/save", "/open", "/color",
-    "/clear", "/host", "/rec", "/quit",
+const COMMANDS: [&str; 15] = [
+    "/help", "/join", "/rooms", "/nick", "/send", "/view", "/play", "/stop", "/save", "/open",
+    "/color", "/clear", "/host", "/rec", "/quit",
 ];
 
 /// Однострочное поле ввода: текст и позиция курсора.
@@ -260,6 +261,8 @@ pub enum Action {
         url: String,
         lines: Vec<String>,
     },
+    /// Список комнат с сервера — или причина, почему его нет.
+    Rooms(Result<Vec<RoomSummary>, String>),
     /// Прокрутка колесом: вверх — положительное число строк.
     Scroll(i32),
     /// Сообщение от самого клиента: сломался ввод, не записался конфиг и т.п.
@@ -298,6 +301,15 @@ pub struct Login {
     pub server: Input,
     pub field: Field,
     pub error: Option<String>,
+    /// Комнаты, живущие сейчас на сервере. Человек выбирает из списка
+    /// стрелками и заходит, ни у кого не спрашивая адрес и не пересылая коды.
+    pub rooms: Vec<RoomSummary>,
+    /// Какая строка списка выбрана. `None` — фокус на полях формы, ввод и
+    /// Enter работают по полю «комната».
+    pub rooms_selected: Option<usize>,
+    /// Что показать над списком: «спрашиваю сервер…» или причина, по которой
+    /// список пуст. Пустой список без пояснения выглядит как поломка.
+    pub rooms_note: Option<String>,
 }
 
 impl Login {
@@ -326,6 +338,38 @@ impl Login {
             (Field::Room, true) => Field::Nickname,
             (Field::Server, true) => Field::Room,
         };
+    }
+
+    /// Стрелка вниз: заходит в список комнат и ведёт по нему. Пока список пуст,
+    /// стрелки, как и раньше, просто перебирают поля формы.
+    fn select_down(&mut self) {
+        if self.rooms.is_empty() {
+            self.next_field(false);
+            return;
+        }
+        let next = match self.rooms_selected {
+            None => 0,
+            Some(i) => (i + 1).min(self.rooms.len() - 1),
+        };
+        self.rooms_selected = Some(next);
+    }
+
+    /// Стрелка вверх: с первой строки списка возвращает фокус на форму.
+    fn select_up(&mut self) {
+        match self.rooms_selected {
+            Some(0) | None if self.rooms.is_empty() => self.next_field(true),
+            Some(0) => self.rooms_selected = None,
+            Some(i) => self.rooms_selected = Some(i - 1),
+            None => self.next_field(true),
+        }
+    }
+
+    /// Имя комнаты, в которую человек собрался войти: выбранная в списке
+    /// перевешивает то, что набрано в поле, — раз уж на неё явно указали.
+    fn chosen_room(&self) -> Option<String> {
+        self.rooms_selected
+            .and_then(|i| self.rooms.get(i))
+            .map(|room| room.name.clone())
     }
 }
 
@@ -386,6 +430,9 @@ pub enum Command {
     },
     /// Поднять сервер прямо в этом клиенте.
     Host(u16),
+    /// Спросить у сервера список комнат для экрана входа. Строка — http-адрес
+    /// сервера (`http://host:port`), с него берётся `GET /rooms`.
+    FetchRooms(String),
     /// Открыть адрес системным просмотрщиком.
     Open(String),
     /// Скачать картинку, чтобы показать её в терминале.
@@ -562,6 +609,9 @@ impl State {
                 server: Input::default(),
                 field: Field::Nickname,
                 error: None,
+                rooms: Vec::new(),
+                rooms_selected: None,
+                rooms_note: None,
             }),
             nickname: String::new(),
             room: room.clone(),
@@ -893,6 +943,53 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
                 server: url,
             }]
         }
+        Action::Rooms(result) => {
+            match &mut state.screen {
+                // На экране входа список ложится в браузер комнат под формой.
+                Screen::Login(login) => match result {
+                    Ok(rooms) => {
+                        login.rooms_note = rooms
+                            .is_empty()
+                            .then(|| "комнат пока нет — впишите имя, и она заведётся".to_string());
+                        // Выбор мог указывать за пределы обновлённого списка.
+                        login.rooms_selected = login.rooms_selected.filter(|&i| i < rooms.len());
+                        login.rooms = rooms;
+                    }
+                    Err(reason) => {
+                        login.rooms.clear();
+                        login.rooms_selected = None;
+                        login.rooms_note = Some(reason);
+                    }
+                },
+                // В чате список печатается строками: он пришёл по команде
+                // /rooms, и человеку остаётся выбрать /join.
+                Screen::Chat => {
+                    state.busy = None;
+                    match result {
+                        Ok(rooms) if rooms.is_empty() => {
+                            state.system(SystemKind::Info, "других комнат сейчас нет");
+                        }
+                        Ok(rooms) => {
+                            state.system(SystemKind::Info, "комнаты на сервере:");
+                            for room in rooms {
+                                let people = if room.users == 1 {
+                                    "1 чел.".to_string()
+                                } else {
+                                    format!("{} чел.", room.users)
+                                };
+                                let here = if room.name == state.room { " · вы здесь" } else { "" };
+                                state.system(
+                                    SystemKind::Info,
+                                    format!("  /join {} — {people}{here}", room.name),
+                                );
+                            }
+                        }
+                        Err(reason) => state.system(SystemKind::Error, reason),
+                    }
+                }
+            }
+            Vec::new()
+        }
         Action::Uploaded(Ok(attachment)) => {
             state.busy = None;
             state.system(SystemKind::Info, format!("отправляю {}", attachment.name));
@@ -1008,14 +1105,47 @@ fn on_login_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
 
     match key.code {
         KeyCode::Enter => return login_submit(state),
-        KeyCode::Tab | KeyCode::Down => login.next_field(false),
-        KeyCode::BackTab | KeyCode::Up => login.next_field(true),
+        // Tab — по полям формы; стрелки — по списку комнат (а когда список
+        // пуст, они тоже перебирают поля, как раньше).
+        KeyCode::Tab => login.next_field(false),
+        KeyCode::BackTab => login.next_field(true),
+        KeyCode::Down => login.select_down(),
+        KeyCode::Up => login.select_up(),
+        // Ctrl+R — обновить список комнат с адреса, что сейчас в поле.
+        KeyCode::Char('r') if ctrl => {
+            login.rooms_note = Some("спрашиваю сервер о комнатах…".to_string());
+            let field = login.server.text.clone();
+            return rooms_fetch(&field, &state.server)
+                .map(|command| vec![command])
+                .unwrap_or_default();
+        }
         _ => {
+            // Правка любого поля означает «войду по набранному»: снимаем выбор
+            // из списка, иначе Enter увёл бы не туда, куда смотрит человек.
+            login.rooms_selected = None;
             let limit = login.limit();
             edit_key(login.active(), key, limit);
         }
     }
     Vec::new()
+}
+
+/// Команда «спросить список комнат» для адреса, что сейчас на экране входа.
+///
+/// Адрес берём по тем же правилам, что и при входе: набранное в поле, иначе
+/// уже известный сервер, иначе свой на этой же машине. `None` — если адрес
+/// не разобрать: список тогда просто не обновляется, вход это не ломает.
+fn rooms_fetch(field: &str, current_server: &str) -> Option<Command> {
+    let typed = field.trim();
+    let raw = if !typed.is_empty() {
+        typed.to_string()
+    } else if !current_server.is_empty() {
+        current_server.to_string()
+    } else {
+        crate::net::DEFAULT_SERVER.to_string()
+    };
+    let ws = crate::net::normalize_server(&raw).ok()?;
+    Some(Command::FetchRooms(crate::net::media_base(&ws)))
 }
 
 fn login_submit(state: &mut State) -> Vec<Command> {
@@ -1033,10 +1163,14 @@ fn login_submit(state: &mut State) -> Vec<Command> {
             return Vec::new();
         }
     };
-    let room = match validate::clean_room(&login.room.text) {
+    // Комната, выбранная в списке, перевешивает поле: раз человек подсветил
+    // строку и нажал Enter, он метил именно в неё.
+    let room_raw = login.chosen_room().unwrap_or_else(|| login.room.text.clone());
+    let room = match validate::clean_room(&room_raw) {
         Ok(room) => room,
         Err(err) => {
             login.field = Field::Room;
+            login.rooms_selected = None;
             login.error = Some(err.to_string());
             return Vec::new();
         }
@@ -1572,6 +1706,7 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
         "color" => color_command(state, &arg),
         "host" => host_command(state, &arg),
         "join" => join_command(state, &arg),
+        "rooms" => rooms_command(state),
         "nick" => nick_command(state, &arg),
         other => {
             state.system(
@@ -1817,6 +1952,17 @@ fn join_command(state: &mut State, arg: &str) -> Vec<Command> {
     }]
 }
 
+/// Показывает, какие комнаты сейчас живут на сервере, чтобы перейти в них
+/// командой /join, не выходя из чата.
+fn rooms_command(state: &mut State) -> Vec<Command> {
+    if state.media_base.is_empty() {
+        state.system(SystemKind::Error, "неизвестен адрес сервера");
+        return Vec::new();
+    }
+    state.busy = Some("спрашиваю комнаты".to_string());
+    vec![Command::FetchRooms(state.media_base.clone())]
+}
+
 fn nick_command(state: &mut State, arg: &str) -> Vec<Command> {
     let nickname = match validate::clean_nickname(arg) {
         Ok(nickname) => nickname,
@@ -1860,8 +2006,16 @@ fn on_net(state: &mut State, event: NetEvent) -> Vec<Command> {
                 server: Input::new(state.server.clone()),
                 field: Field::Nickname,
                 error: Some(reason),
+                rooms: Vec::new(),
+                rooms_selected: None,
+                rooms_note: Some("спрашиваю сервер о комнатах…".to_string()),
             });
             state.users.clear();
+            // Вернулись на экран входа — заодно освежаем список комнат: адрес
+            // и так известен, а видеть, куда можно зайти, полезно сразу.
+            return rooms_fetch(&state.server, &state.server)
+                .map(|command| vec![command])
+                .unwrap_or_default();
         }
         NetEvent::Message(msg) => return on_server(state, msg),
     }
@@ -2303,6 +2457,122 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn some_rooms() -> Vec<RoomSummary> {
+        vec![
+            RoomSummary {
+                name: "rust".into(),
+                users: 2,
+            },
+            RoomSummary {
+                name: "talk".into(),
+                users: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn login_shows_the_rooms_it_is_given() {
+        let (mut state, _) = State::new(None, "general".into());
+
+        update(&mut state, Action::Rooms(Ok(some_rooms())));
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("не экран входа");
+        };
+        assert_eq!(login.rooms.len(), 2);
+        assert!(login.rooms_note.is_none());
+    }
+
+    #[test]
+    fn picking_a_room_from_the_list_joins_it() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, Action::Rooms(Ok(some_rooms())));
+
+        // Стрелка вниз выбирает первую комнату, вниз ещё раз — вторую.
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Connect { room, nickname, .. }]
+                    if room == "talk" && nickname == "alice"
+            ),
+            "{commands:?}"
+        );
+        assert!(matches!(state.screen, Screen::Chat));
+    }
+
+    #[test]
+    fn typing_a_room_beats_a_stale_selection() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, Action::Rooms(Ok(some_rooms())));
+        update(&mut state, key(KeyCode::Down)); // выбрали «rust»
+
+        // Переходим в поле «комната» и дописываем — выбор из списка снимается.
+        update(&mut state, key(KeyCode::Tab)); // ник -> комната
+        typed(&mut state, "x");
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Connect { room, .. }] if room == "generalx"
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_up_from_the_top_returns_focus_to_the_form() {
+        let (mut state, _) = State::new(None, "general".into());
+        update(&mut state, Action::Rooms(Ok(some_rooms())));
+
+        update(&mut state, key(KeyCode::Down)); // выбор -> 0
+        update(&mut state, key(KeyCode::Up)); // с нулевой обратно на форму
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("не экран входа");
+        };
+        assert_eq!(login.rooms_selected, None);
+    }
+
+    #[test]
+    fn ctrl_r_on_login_asks_the_server_again() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.set_server("ws://192.168.1.5:8080/ws".into());
+
+        let commands = update(&mut state, ctrl('r'));
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::FetchRooms(base)] if base == "http://192.168.1.5:8080"
+            ),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_room_query_explains_itself() {
+        let (mut state, _) = State::new(None, "general".into());
+        update(&mut state, Action::Rooms(Ok(some_rooms())));
+
+        update(
+            &mut state,
+            Action::Rooms(Err("сервер не ответил".into())),
+        );
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("не экран входа");
+        };
+        assert!(login.rooms.is_empty());
+        assert_eq!(login.rooms_note.as_deref(), Some("сервер не ответил"));
     }
 
     #[test]

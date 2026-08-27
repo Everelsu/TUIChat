@@ -5,7 +5,7 @@ pub mod validate;
 
 pub use protocol::{
     Attachment, AttachmentKind, ChatMessage, ClientMessage, ErrorCode, REPLY_EXCERPT_CHARS,
-    ReplyPreview, ServerMessage, UserId, UserInfo,
+    ReplyPreview, RoomSummary, ServerMessage, UserId, UserInfo,
 };
 pub use validate::{
     MAX_FRAME_BYTES, MAX_NICKNAME_CHARS, MAX_ROOM_CHARS, MAX_TEXT_CHARS, MAX_UPLOAD_BYTES,

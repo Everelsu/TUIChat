@@ -45,6 +45,12 @@
       </label>
       <button type="submit">Войти</button>
       <p id="join-error" class="error" hidden></p>
+      <!-- Список живущих комнат: тап по комнате подставляет её имя, так что
+           адрес друг другу пересылать не нужно. -->
+      <div id="rooms" class="rooms" hidden>
+        <span class="rooms-title">Комнаты на сервере</span>
+        <ul id="rooms-list" class="rooms-list"></ul>
+      </div>
     </form>
 
     <!-- Экран чата -->

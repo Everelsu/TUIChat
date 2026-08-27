@@ -325,6 +325,24 @@ impl Hub {
         lock(&self.rooms).len()
     }
 
+    /// Снимок списка комнат для экрана входа: имя и сколько человек внутри.
+    ///
+    /// Пустых комнат тут не бывает — они удаляются вместе с последним ушедшим,
+    /// так что список показывает ровно то, где сейчас кто-то есть. Сортировка
+    /// по имени, чтобы порядок не прыгал между запросами.
+    pub fn rooms_summary(&self) -> Vec<common::RoomSummary> {
+        let rooms = lock(&self.rooms);
+        let mut list: Vec<common::RoomSummary> = rooms
+            .iter()
+            .map(|(name, room)| common::RoomSummary {
+                name: name.clone(),
+                users: room.peers.len(),
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
     pub fn user_count(&self, room_name: &str) -> usize {
         lock(&self.rooms)
             .get(room_name)
@@ -372,6 +390,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/icon.svg", get(icon))
         .route("/sw.js", get(service_worker))
         .route("/ws", get(ws_handler))
+        .route("/rooms", get(rooms))
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/upload",
@@ -478,6 +497,13 @@ async fn service_worker() -> impl IntoResponse {
         ],
         include_str!("../../web/sw.js"),
     )
+}
+
+/// Список активных комнат — чтобы клиент показал их на экране входа, а человек
+/// зашёл в нужную, ни у кого не спрашивая адрес. Пустых комнат тут нет: они на
+/// сервере не живут.
+async fn rooms(State(state): State<AppState>) -> Json<Vec<common::RoomSummary>> {
+    Json(state.hub.rooms_summary())
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {

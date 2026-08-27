@@ -546,8 +546,21 @@ fn draw_field(frame: &mut Frame, input: &Input, area: Rect, prefix: &str) {
     ));
 }
 
+/// Сколько строк списка комнат показываем разом. Больше — список вытесняет
+/// саму форму; выбранная строка держится в этом окне прокруткой.
+const LOGIN_ROOMS_VISIBLE: usize = 8;
+
 fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
-    let form = centered(area, 52, 11);
+    // Тело списка: под комнаты или под пояснение, почему их нет. Пустая
+    // строка вместо списка выглядела бы как оборванная форма.
+    let list_body = if login.rooms.is_empty() {
+        1
+    } else {
+        login.rooms.len().min(LOGIN_ROOMS_VISIBLE)
+    };
+    // 9 строк формы + подсказка + отступ + заголовок списка + сам список.
+    let wanted = 9 + 1 + 1 + 1 + list_body as u16;
+    let form = centered(area, 54, wanted);
     if form.height < 5 {
         return;
     }
@@ -560,7 +573,10 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
         Constraint::Length(1), // поле комнаты
         Constraint::Length(1), // подпись «сервер»
         Constraint::Length(1), // поле сервера
-        Constraint::Min(0),    // ошибка или подсказка
+        Constraint::Length(1), // ошибка или подсказка
+        Constraint::Length(1), // отступ
+        Constraint::Length(1), // заголовок списка комнат
+        Constraint::Min(0),    // список комнат
     ])
     .split(form);
 
@@ -582,31 +598,102 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
     );
 
     // Активное поле помечено стрелкой, остальные просто нарисованы: курсор
-    // в терминале один, и он должен стоять там, куда попадёт ввод.
+    // в терминале один, и он должен стоять там, куда попадёт ввод. Пока
+    // выбрана комната из списка, курсор в поле не мигаем — ввод уйдёт туда,
+    // куда смотрит выделение.
+    let field_focus = login.rooms_selected.is_none();
     let fields = [
         (Field::Nickname, &login.nickname, rows[2]),
         (Field::Room, &login.room, rows[4]),
         (Field::Server, &login.server, rows[6]),
     ];
     for (field, input, row) in fields {
-        if field == login.field {
+        if field == login.field && field_focus {
             draw_field(frame, input, row, "> ");
         } else {
             frame.render_widget(Paragraph::new(format!("  {}", input.text)), row);
         }
     }
 
-    if rows[7].height == 0 {
-        return;
-    }
     let footer = match &login.error {
         Some(error) => Line::from(Span::styled(error.clone(), Style::new().fg(palette::ERR))),
         None => Line::from(Span::styled(
-            "tab — поле · enter — войти · пусто в «сервере» — свой",
+            "tab — поле · ↑↓ — комната · enter — войти · ctrl+r — обновить",
             label,
         )),
     };
     frame.render_widget(Paragraph::new(footer), rows[7]);
+
+    draw_login_rooms(frame, login, rows[9], rows[10]);
+}
+
+/// Список живущих на сервере комнат под формой входа: выбрал стрелками —
+/// и зашёл, ни у кого не спрашивая адрес.
+fn draw_login_rooms(frame: &mut Frame, login: &Login, header: Rect, body: Rect) {
+    let label = Style::new().fg(palette::FAINT);
+    frame.render_widget(
+        Paragraph::new(Span::styled("комнаты на сервере", label)),
+        header,
+    );
+
+    if body.height == 0 {
+        return;
+    }
+
+    // Список пуст: показываем не пустоту, а причину — «спрашиваю…», «сервер
+    // не ответил» или «комнат пока нет».
+    if login.rooms.is_empty() {
+        let note = login
+            .rooms_note
+            .clone()
+            .unwrap_or_else(|| "нажмите ctrl+r, чтобы обновить".to_string());
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("  {note}"), Style::new().fg(palette::DIM))),
+            body,
+        );
+        return;
+    }
+
+    let visible = (body.height as usize).min(LOGIN_ROOMS_VISIBLE);
+    // Прокрутка держит выбранную строку в окне: без неё выбор ниже восьмой
+    // комнаты уезжал бы за край.
+    let start = match login.rooms_selected {
+        Some(i) if i >= visible => i + 1 - visible,
+        _ => 0,
+    };
+
+    let lines: Vec<Line> = login
+        .rooms
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, room)| {
+            let selected = login.rooms_selected == Some(i);
+            let (marker, name_style) = if selected {
+                (
+                    "> ",
+                    Style::new()
+                        .fg(palette::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::new())
+            };
+            let people = if room.users == 1 {
+                "1 чел.".to_string()
+            } else {
+                format!("{} чел.", room.users)
+            };
+            Line::from(vec![
+                Span::styled(marker, name_style),
+                Span::styled(room.name.clone(), name_style),
+                Span::styled(format!("  ·  {people}"), label),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 fn draw_viewer(frame: &mut Frame, viewer: &Viewer, area: Rect, images: &mut Images) {
