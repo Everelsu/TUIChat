@@ -10,7 +10,7 @@
 
 use std::io::{Cursor, Read, Write};
 
-use common::{Attachment, validate};
+use common::Attachment;
 use image::{ImageReader, Limits, RgbImage, imageops::FilterType};
 use ratatui::{
     style::{Color, Style},
@@ -56,24 +56,44 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
 ///
 /// Годится и картинка, и голосовое — как готовое с диска, так и только что
 /// записанное с микрофона.
-pub fn upload(base: &str, path: &std::path::Path) -> Result<Attachment, String> {
+pub fn upload(base: &str, path: &std::path::Path, limit: usize) -> Result<Attachment, String> {
+    // Размер узнаём до чтения: тянуть в память гигабайт, чтобы потом сказать
+    // «не влезло», — худший способ отказать.
+    if let Ok(meta) = std::fs::metadata(path) {
+        fits(meta.len() as usize, limit)?;
+    }
     let bytes = std::fs::read(path).map_err(|err| format!("не удалось прочитать файл: {err}"))?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "файл".to_string());
-    upload_bytes(base, &name, bytes)
+    upload_bytes(base, &name, bytes, limit)
+}
+
+/// Влезает ли файл в потолок сервера.
+///
+/// Мегабайты, а не килобайты: на сотне мегабайт число в килобайтах человеку
+/// уже ничего не говорит.
+fn fits(size: usize, limit: usize) -> Result<(), String> {
+    if size <= limit {
+        return Ok(());
+    }
+    const MB: usize = 1024 * 1024;
+    Err(format!(
+        "файл слишком большой: {} МБ при потолке {} МБ у этого сервера",
+        size.div_ceil(MB),
+        limit / MB
+    ))
 }
 
 /// То же самое, но для того, что и так уже в памяти: записанного голосового.
-pub fn upload_bytes(base: &str, name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
-    if bytes.len() > validate::MAX_UPLOAD_BYTES {
-        return Err(format!(
-            "файл слишком большой: {} КБ при потолке {} КБ",
-            bytes.len() / 1024,
-            validate::MAX_UPLOAD_BYTES / 1024
-        ));
-    }
+pub fn upload_bytes(
+    base: &str,
+    name: &str,
+    bytes: Vec<u8>,
+    limit: usize,
+) -> Result<Attachment, String> {
+    fits(bytes.len(), limit)?;
 
     let Some(rest) = base.strip_prefix("http://") else {
         return Err("отправка по https из терминала пока не поддерживается".into());
@@ -139,14 +159,13 @@ Connection: close
 }
 
 /// Отправляет файл — по http или через туннель.
-pub async fn upload_any(base: String, name: String, bytes: Vec<u8>) -> Result<Attachment, String> {
-    if bytes.len() > validate::MAX_UPLOAD_BYTES {
-        return Err(format!(
-            "файл слишком большой: {} КБ при потолке {} КБ",
-            bytes.len() / 1024,
-            validate::MAX_UPLOAD_BYTES / 1024
-        ));
-    }
+pub async fn upload_any(
+    base: String,
+    name: String,
+    bytes: Vec<u8>,
+    limit: usize,
+) -> Result<Attachment, String> {
+    fits(bytes.len(), limit)?;
 
     if let Some((ticket, _)) = split_tunnel(&base) {
         let head = format!(
@@ -164,7 +183,7 @@ Connection: close
             .map_err(|err| format!("непонятный ответ сервера: {err}"));
     }
 
-    tokio::task::spawn_blocking(move || upload_bytes(&base, &name, bytes))
+    tokio::task::spawn_blocking(move || upload_bytes(&base, &name, bytes, limit))
         .await
         .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")))
 }
@@ -604,8 +623,12 @@ mod tests {
 
     #[test]
     fn missing_file_is_reported() {
-        let error =
-            upload("http://127.0.0.1:1", std::path::Path::new("нет-такого.png")).unwrap_err();
+        let error = upload(
+            "http://127.0.0.1:1",
+            std::path::Path::new("нет-такого.png"),
+            common::validate::MAX_UPLOAD_BYTES,
+        )
+        .unwrap_err();
 
         assert!(error.contains("прочитать"), "невнятная причина: {error}");
     }

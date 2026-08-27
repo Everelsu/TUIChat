@@ -1,5 +1,5 @@
 [package]
-name = "tui"
+name = "null_terminal"
 version.workspace = true
 edition.workspace = true
 

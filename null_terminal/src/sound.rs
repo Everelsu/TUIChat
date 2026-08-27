@@ -19,7 +19,10 @@ use std::{
 
 use rodio::{
     ChannelCount, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate, Source,
-    buffer::SamplesBuffer, microphone::MicrophoneBuilder, source::SineWave,
+    buffer::SamplesBuffer,
+    cpal::traits::{DeviceTrait, HostTrait},
+    microphone::MicrophoneBuilder,
+    source::SineWave,
     source::UniformSourceIterator,
 };
 
@@ -32,10 +35,67 @@ const VOICE_RATE: u32 = 16_000;
 /// не должна упереться в лимит размера уже после разговора.
 const MAX_RECORD_SECONDS: u64 = 150;
 
-/// Длительность и громкость сигнала. Уведомление должно быть заметным,
-/// но не пугать: в наушниках это играет прямо в ухо.
+/// Длительность сигнала. Уведомление должно быть заметным, но не пугать:
+/// в наушниках это играет прямо в ухо.
 const CHIME_MS: u64 = 90;
-const CHIME_GAIN: f32 = 0.12;
+
+/// Три ступени громкости сигнала. Не ползунок: разница между тихим и громким
+/// в наушниках и так велика, а крутить проценты в чате никто не станет.
+pub const GAINS: [f32; 3] = [0.05, 0.12, 0.25];
+
+/// Имя устройства, выбранного человеком, или «как в системе».
+///
+/// Храним именно имя, а не номер в списке: наушники втыкают и вынимают, и
+/// после перезапуска третье устройство — уже не то же самое.
+pub type Choice = Option<String>;
+
+/// Как зовут устройства вывода. Пустой список означает, что звука на машине
+/// нет вовсе — это не поломка, чат работает и молча.
+pub fn outputs() -> Vec<String> {
+    // Через cpal напрямую: перечисление динамиков в самом rodio пока спрятано
+    // за экспериментальной фичей, а список устройств — не то место, ради
+    // которого стоит на неё соглашаться.
+    let Ok(devices) = rodio::cpal::default_host().output_devices() else {
+        return Vec::new();
+    };
+    devices
+        .filter_map(|device| Some(device.description().ok()?.name().to_string()))
+        .collect()
+}
+
+/// Как зовут микрофоны.
+pub fn inputs() -> Vec<String> {
+    rodio::microphone::available_inputs()
+        .map(|list| list.iter().map(|device| device.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Открывает вывод: названное устройство, а если его не нашлось — системное.
+///
+/// Не нашлось — обычное дело: наушники выдернули между запусками. Молча
+/// вернуться к системному лучше, чем остаться без звука вовсе.
+fn open_output(name: Option<&str>) -> Option<MixerDeviceSink> {
+    let chosen = name.and_then(|name| {
+        rodio::cpal::default_host()
+            .output_devices()
+            .ok()?
+            .find(|device| device.description().is_ok_and(|found| found.name() == name))
+    });
+
+    let opened = chosen.and_then(|device| {
+        DeviceSinkBuilder::from_device(device)
+            .ok()?
+            .open_stream()
+            .ok()
+    });
+    let mut sink = match opened {
+        Some(sink) => sink,
+        None => DeviceSinkBuilder::open_default_sink().ok()?,
+    };
+    // Иначе rodio при выходе пишет диагностику прямо поверх интерфейса.
+    sink.log_on_drop(false);
+    Some(sink)
+}
 
 /// Идущая запись с микрофона.
 struct Recording {
@@ -51,21 +111,24 @@ pub struct Sound {
     /// Проигрываемое голосовое. Хранится, потому что звук идёт, пока живёт
     /// этот объект: уронив его сразу, мы услышали бы только щелчок.
     voice: Option<Player>,
+    /// Микрофон, выбранный человеком. Открывается на время записи, а не
+    /// заранее: держать открытым микрофон, которым не пользуются, — верный
+    /// способ засветить индикатор записи в системе на всю сессию.
+    input: Choice,
+    /// Громкость сигнала — номер ступени в [`GAINS`].
+    gain: usize,
 }
 
 impl Sound {
     /// Открывает устройство. Отсутствие звуковой карты — не повод падать:
     /// чат должен работать и на машине вообще без звука.
     pub fn open() -> Self {
-        let device = DeviceSinkBuilder::open_default_sink().ok().map(|mut sink| {
-            // Иначе rodio при выходе пишет диагностику прямо поверх интерфейса.
-            sink.log_on_drop(false);
-            sink
-        });
         Self {
-            device,
+            device: open_output(None),
             recording: None,
             voice: None,
+            input: None,
+            gain: 1,
         }
     }
 
@@ -74,7 +137,27 @@ impl Sound {
             device: None,
             recording: None,
             voice: None,
+            input: None,
+            gain: 1,
         }
+    }
+
+    /// Переключает устройства на ходу.
+    ///
+    /// Вывод переоткрывается сразу — иначе непонятно, подействовал ли выбор;
+    /// микрофон только запоминается, он открывается на время записи.
+    /// `false` означает, что вывод открыть не удалось: звука не будет, и
+    /// сказать об этом надо.
+    pub fn use_devices(&mut self, output: Option<&str>, input: Choice) -> bool {
+        self.stop_voice();
+        self.device = open_output(output);
+        self.input = input;
+        self.device.is_some()
+    }
+
+    /// Ступень громкости сигнала.
+    pub fn set_gain(&mut self, step: usize) {
+        self.gain = step.min(GAINS.len() - 1);
     }
 
     pub fn is_recording(&self) -> bool {
@@ -100,10 +183,24 @@ impl Sound {
 
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let chosen = self.input.clone();
         let worker = std::thread::spawn(move || {
-            let mic = MicrophoneBuilder::new()
-                .default_device()
-                .map_err(|err| format!("микрофон не найден: {err}"))?
+            let builder = MicrophoneBuilder::new();
+            // Выбранный микрофон, а если его больше нет — системный: гарнитуру
+            // выдёргивают, и запись из-за этого падать не должна.
+            let named = chosen.as_deref().and_then(|name| {
+                rodio::microphone::available_inputs()
+                    .ok()?
+                    .into_iter()
+                    .find(|device| device.to_string() == name)
+            });
+            let device = match named.and_then(|device| builder.device(device).ok()) {
+                Some(device) => device,
+                None => builder
+                    .default_device()
+                    .map_err(|err| format!("микрофон не найден: {err}"))?,
+            };
+            let mic = device
                 .default_config()
                 .map_err(|err| format!("микрофон не настроить: {err}"))?
                 .open_stream()
@@ -173,12 +270,13 @@ impl Sound {
             return;
         };
 
+        let gain = GAINS[self.gain.min(GAINS.len() - 1)];
         let first = SineWave::new(880.0)
             .take_duration(std::time::Duration::from_millis(CHIME_MS))
-            .amplify(CHIME_GAIN);
+            .amplify(gain);
         let second = SineWave::new(1320.0)
             .take_duration(std::time::Duration::from_millis(CHIME_MS))
-            .amplify(CHIME_GAIN)
+            .amplify(gain)
             // Плавное затухание: обрыв синуса на полуволне слышен как щелчок.
             .fade_out(std::time::Duration::from_millis(CHIME_MS));
 

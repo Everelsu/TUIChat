@@ -13,7 +13,11 @@ use std::{
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-const APP_DIR: &str = "tuichat";
+const APP_DIR: &str = "null_terminal";
+
+/// Каталог прошлой версии. Настройки оттуда читаются один раз, если своего
+/// файла ещё нет: смена имени программы не повод терять ник, цвета и адрес.
+const OLD_APP_DIR: &str = "tuichat";
 const FILE: &str = "config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +40,17 @@ pub struct Config {
     /// сам». Названный здесь терминал единственный, который годится: раз его
     /// выбрали, уходить в другой молча нельзя.
     pub terminal_program: String,
+    /// Тема оформления: `charple`, `dolly`, `mint` или `ember`.
+    pub theme: String,
+    /// Показывать ли колонку с людьми справа от переписки.
+    pub sidebar: bool,
+    /// Имена звуковых устройств. Пустая строка — «как в системе»: этот выбор
+    /// переживает и смену наушников, и переустановку драйверов.
+    pub sound_output: String,
+    pub sound_input: String,
+    /// Подавать ли сигнал при упоминании и как громко (ступень 0-2).
+    pub chime: bool,
+    pub volume: u8,
     /// Цвета ников: ключ — ник в нижнем регистре, значение — `#rrggbb`
     /// или название вроде `cyan`.
     pub colors: BTreeMap<String, String>,
@@ -51,6 +66,12 @@ impl Default for Config {
             inline_images: None,
             terminal: "auto".to_string(),
             terminal_program: String::new(),
+            theme: crate::theme::Theme::default().name().to_string(),
+            sidebar: false,
+            sound_output: String::new(),
+            sound_input: String::new(),
+            chime: true,
+            volume: 1,
             colors: BTreeMap::new(),
         }
     }
@@ -58,18 +79,27 @@ impl Default for Config {
 
 /// Каталог с настройками и журналом падений.
 pub fn dir() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
+    Some(base()?.join(APP_DIR))
+}
+
+/// Куда операционная система кладёт настройки программ.
+fn base() -> Option<PathBuf> {
+    if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    };
-    Some(base?.join(APP_DIR))
+    }
 }
 
 pub fn path() -> Option<PathBuf> {
     Some(dir()?.join(FILE))
+}
+
+/// Файл настроек прошлой версии, когда программа звалась иначе.
+fn old_path() -> Option<PathBuf> {
+    Some(base()?.join(OLD_APP_DIR).join(FILE))
 }
 
 impl Config {
@@ -79,7 +109,12 @@ impl Config {
         let Some(path) = path() else {
             return Self::default();
         };
-        let Ok(text) = fs::read_to_string(&path) else {
+        // Своего файла ещё нет — заглядываем туда, где лежал файл прошлой
+        // версии. Переименование программы не должно стоить человеку ника,
+        // цветов и адреса сервера.
+        let text = fs::read_to_string(&path)
+            .or_else(|_| fs::read_to_string(old_path().unwrap_or_default()));
+        let Ok(text) = text else {
             return Self::default();
         };
         toml::from_str(&text).unwrap_or_default()

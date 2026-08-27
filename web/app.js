@@ -7,9 +7,10 @@ const PING_EVERY = 30000;
 const PONG_TIMEOUT = 10000;
 const FIRST_BACKOFF = 1000;
 const MAX_BACKOFF = 30000;
-/// Тот же потолок, что и на сервере: понятная ошибка лучше, чем отказ в ответ
-/// на пять мегабайт, уже уехавших по сети.
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+/// Потолок вложения, пока сервер не назвал свой: понятная ошибка лучше, чем
+/// отказ в ответ на файл, уже уехавший по сети. Настоящее значение приходит
+/// в приветствии — у каждого сервера оно своё.
+const DEFAULT_UPLOAD_BYTES = 100 * 1024 * 1024;
 /// Две минуты записи с запасом влезают в лимит загрузки, а заодно спасают от
 /// забытой включённой кнопки.
 const MAX_RECORD_MS = 120000;
@@ -48,6 +49,8 @@ const ui = {
 };
 
 const state = {
+  /// Потолок вложения этого сервера. Уточняется в приветствии.
+  uploadLimit: DEFAULT_UPLOAD_BYTES,
   socket: null,
   nickname: "",
   room: "",
@@ -172,6 +175,8 @@ function handle(message) {
       state.joined = true;
       state.attempt = 0;
       state.users = [...message.users, { id: message.your_id, nickname: message.nickname }];
+      // Потолок задаёт сервер: у чужого он может быть и меньше, и больше.
+      state.uploadLimit = message.upload_limit ?? DEFAULT_UPLOAD_BYTES;
       remember();
       ui.roomName.textContent = `#${message.room}`;
       showUsers();
@@ -244,7 +249,7 @@ function nickColor(nickname) {
   const bytes = new TextEncoder().encode(nickname.toLowerCase());
   let hash = 0;
   for (const byte of bytes) hash = (Math.imul(hash, 31) + byte) >>> 0;
-  return `var(--nick-${hash % 6})`;
+  return `var(--nick-${hash % 8})`;
 }
 
 function mentionsMe(text) {
@@ -366,9 +371,11 @@ function attachmentNode(attachment) {
 /// в поле ввода.
 async function uploadAndSend(file) {
   if (!file) return;
-  if (file.size > MAX_UPLOAD_BYTES) {
+  if (file.size > state.uploadLimit) {
     addSystem(
-      `${file.name}: слишком большой файл, максимум ${MAX_UPLOAD_BYTES / 1024 / 1024} МБ`,
+      `${file.name}: слишком большой файл, максимум ${Math.floor(
+        state.uploadLimit / 1024 / 1024,
+      )} МБ`,
       true,
     );
     return;

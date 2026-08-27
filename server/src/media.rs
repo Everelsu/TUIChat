@@ -15,7 +15,22 @@ use common::{Attachment, AttachmentKind, validate};
 use uuid::Uuid;
 
 /// Сколько всего байт вложений держим.
-pub const DEFAULT_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
+///
+/// Больше потолка одного файла в несколько раз: иначе первая же отправка
+/// вытесняла бы всё, что было до неё.
+pub const DEFAULT_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Потолок одного файла и всего хранилища, как их задали при запуске.
+///
+/// Переменные считаются в мегабайтах: в байтах такое число никто не наберёт
+/// без ошибки. Ноль и мусор игнорируются — остаётся значение по умолчанию.
+pub fn limit_from_env(name: &str, fallback: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|megabytes| *megabytes > 0)
+        .map_or(fallback, |megabytes| megabytes * 1024 * 1024)
+}
 
 #[derive(Clone)]
 pub struct StoredFile {
@@ -74,21 +89,35 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub struct MediaStore {
     capacity: usize,
+    /// Потолок одного файла. Живёт здесь, а не константой: у каждого сервера
+    /// он свой, и клиент узнаёт его при входе.
+    limit: usize,
     files: Mutex<Files>,
 }
 
 impl Default for MediaStore {
     fn default() -> Self {
-        Self::new(DEFAULT_CAPACITY_BYTES)
+        let limit = limit_from_env("CHAT_MAX_UPLOAD_MB", validate::MAX_UPLOAD_BYTES);
+        // Хранилище меньше одного файла означало бы, что не влезает ничто:
+        // настроить такое можно только по недосмотру, и молча чинить это
+        // правильнее, чем отвергать каждую отправку.
+        let capacity = limit_from_env("CHAT_MEDIA_CAPACITY_MB", DEFAULT_CAPACITY_BYTES).max(limit);
+        Self::new(capacity, limit)
     }
 }
 
 impl MediaStore {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, limit: usize) -> Self {
         Self {
             capacity,
+            limit,
             files: Mutex::new(Files::default()),
         }
+    }
+
+    /// Какой файл этот сервер согласен принять.
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// Принимает файл и возвращает его описание.
@@ -99,10 +128,10 @@ impl MediaStore {
         if bytes.is_empty() {
             return Err(MediaError::Empty);
         }
-        if bytes.len() > validate::MAX_UPLOAD_BYTES {
+        if bytes.len() > self.limit {
             return Err(MediaError::TooLarge {
                 size: bytes.len(),
-                limit: validate::MAX_UPLOAD_BYTES,
+                limit: self.limit,
             });
         }
         let (mime, kind) = sniff(&bytes);
@@ -202,6 +231,36 @@ fn sniff(bytes: &[u8]) -> (&'static str, AttachmentKind) {
 
 #[cfg(test)]
 mod tests {
+    /// Потолок одного файла задаёт сервер, а не константа в клиенте.
+    #[test]
+    fn the_store_refuses_what_is_bigger_than_its_own_limit() {
+        let store = MediaStore::new(10_000, 1_000);
+
+        let small = store.put("кот.png", png(500));
+        let big = store.put("слон.png", png(2_000));
+
+        assert!(small.is_ok(), "{small:?}");
+        assert_eq!(store.limit(), 1_000);
+        assert!(
+            matches!(big, Err(MediaError::TooLarge { limit: 1_000, .. })),
+            "{big:?}"
+        );
+    }
+
+    #[test]
+    fn megabytes_from_the_environment_are_read_and_nonsense_is_ignored() {
+        // Переменная считается в мегабайтах: в байтах такое число никто не
+        // наберёт без ошибки.
+        unsafe { std::env::set_var("CHAT_TEST_LIMIT", "7") };
+        assert_eq!(limit_from_env("CHAT_TEST_LIMIT", 42), 7 * 1024 * 1024);
+
+        for junk in ["0", "", "сто", "-5"] {
+            unsafe { std::env::set_var("CHAT_TEST_LIMIT", junk) };
+            assert_eq!(limit_from_env("CHAT_TEST_LIMIT", 42), 42, "{junk:?}");
+        }
+        unsafe { std::env::remove_var("CHAT_TEST_LIMIT") };
+    }
+
     use super::*;
 
     fn png(size: usize) -> Bytes {
@@ -307,7 +366,7 @@ mod tests {
 
     #[test]
     fn oldest_files_are_evicted_when_the_space_runs_out() {
-        let store = MediaStore::new(1000);
+        let store = MediaStore::new(1000, validate::MAX_UPLOAD_BYTES);
 
         let first = store.put("первый.png", png(600)).unwrap();
         let second = store.put("второй.png", png(600)).unwrap();

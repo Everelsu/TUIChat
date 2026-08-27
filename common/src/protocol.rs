@@ -64,6 +64,11 @@ pub const REPLY_EXCERPT_CHARS: usize = 60;
 /// Одна реплика в комнате.
 ///
 /// Отдельный тип, потому что живёт в двух местах: приходит по одной штуке в
+/// Потолок вложения для старых серверов, которые о нём не рассказывают.
+fn default_upload_limit() -> u64 {
+    crate::validate::MAX_UPLOAD_BYTES as u64
+}
+
 /// `Chat` и пачкой в `Welcome` как история комнаты.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -123,6 +128,11 @@ pub enum ServerMessage {
         nickname: String,
         users: Vec<UserInfo>,
         history: Vec<ChatMessage>,
+        /// Какой файл этот сервер согласен принять. Клиент проверяет размер
+        /// сам, чтобы не гнать по сети то, что всё равно отвергнут, — но
+        /// правило задаёт сервер, а не константа в клиенте.
+        #[serde(default = "default_upload_limit")]
+        upload_limit: u64,
     },
     UserJoined {
         user: UserInfo,

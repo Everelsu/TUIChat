@@ -83,6 +83,7 @@ mod tests {
             nickname: "alice".into(),
             users: vec![user.clone()],
             history: vec![message.clone()],
+            upload_limit: validate::MAX_UPLOAD_BYTES as u64,
         });
         roundtrip_server(ServerMessage::UserJoined { user: user.clone() });
         roundtrip_server(ServerMessage::UserLeft { user: user.clone() });

@@ -28,7 +28,7 @@ const KEEP_PREPARED: usize = 8;
 pub struct Images {
     picker: Option<Picker>,
     /// Уже закодированные картинки: кодирование не бесплатное, а кадров
-    /// восемь в секунду.
+    /// шестнадцать в секунду.
     prepared: HashMap<Uuid, StatefulProtocol>,
     /// Порядок обращения — по нему вытесняем давно не нужные.
     order: Vec<Uuid>,

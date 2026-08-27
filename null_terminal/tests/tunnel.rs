@@ -33,7 +33,7 @@ const ATTEMPTS: usize = 3;
 /// Сначала дожидается прямого адреса. Сразу после запуска его может не быть —
 /// в `addr()` лежит только релей, и соединение даже с самим собой пошло бы
 /// через интернет: медленно, а под нагрузкой и вовсе мимо.
-async fn dial(tunnel: &tui::tunnel::Tunnel) -> tui::tunnel::Duplex {
+async fn dial(tunnel: &null_terminal::tunnel::Tunnel) -> null_terminal::tunnel::Duplex {
     let waited = timeout(PATIENCE, async {
         while tunnel.direct_addrs() == 0 {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -44,7 +44,7 @@ async fn dial(tunnel: &tui::tunnel::Tunnel) -> tui::tunnel::Duplex {
 
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
-        match timeout(PATIENCE, tui::tunnel::connect_to(tunnel.addr())).await {
+        match timeout(PATIENCE, null_terminal::tunnel::connect_to(tunnel.addr())).await {
             Ok(Ok(duplex)) => return duplex,
             Ok(Err(reason)) => last = reason,
             Err(_) => last = "не уложились в срок".to_string(),
@@ -67,7 +67,9 @@ async fn spawn_server() -> u16 {
 #[tokio::test]
 async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
     let port = spawn_server().await;
-    let tunnel = tui::tunnel::serve(port).await.expect("туннель не поднялся");
+    let tunnel = null_terminal::tunnel::serve(port)
+        .await
+        .expect("туннель не поднялся");
 
     // --- переписка ---
 
@@ -113,7 +115,12 @@ async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
     let png = png_bytes();
     let attachment = timeout(
         PATIENCE,
-        tui::media::upload_any(base.clone(), "кот.png".to_string(), png.clone()),
+        null_terminal::media::upload_any(
+            base.clone(),
+            "кот.png".to_string(),
+            png.clone(),
+            common::validate::MAX_UPLOAD_BYTES,
+        ),
     )
     .await
     .expect("отправка не уложилась в срок")
@@ -123,7 +130,7 @@ async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
     assert_eq!(attachment.size, png.len() as u64);
 
     let url = format!("{base}/media/{}", attachment.id);
-    let downloaded = timeout(PATIENCE, tui::media::fetch_any(url))
+    let downloaded = timeout(PATIENCE, null_terminal::media::fetch_any(url))
         .await
         .expect("скачивание не уложилось в срок")
         .expect("не удалось скачать вложение");
@@ -133,10 +140,13 @@ async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
 
     // Тоже отдельный запрос, и нужен он ровно тогда, когда человеку прислали
     // тикет: на экране входа, до всякого разговора.
-    let bytes = timeout(PATIENCE, tui::media::fetch_any(format!("{base}/rooms")))
-        .await
-        .expect("запрос комнат не уложился в срок")
-        .expect("не удалось спросить комнаты");
+    let bytes = timeout(
+        PATIENCE,
+        null_terminal::media::fetch_any(format!("{base}/rooms")),
+    )
+    .await
+    .expect("запрос комнат не уложился в срок")
+    .expect("не удалось спросить комнаты");
     let rooms: Vec<common::RoomSummary> =
         serde_json::from_slice(&bytes).expect("ответ — не список комнат");
     assert_eq!(rooms.len(), 1, "видно должно быть ровно одну комнату");
@@ -152,9 +162,11 @@ async fn a_whole_conversation_with_attachments_goes_through_the_tunnel() {
 #[ignore = "нужен интернет: тикет разрешается через координатор"]
 async fn a_ticket_alone_is_enough_over_the_internet() {
     let port = spawn_server().await;
-    let tunnel = tui::tunnel::serve(port).await.expect("туннель не поднялся");
+    let tunnel = null_terminal::tunnel::serve(port)
+        .await
+        .expect("туннель не поднялся");
 
-    let duplex = timeout(PATIENCE, tui::tunnel::connect(&tunnel.ticket))
+    let duplex = timeout(PATIENCE, null_terminal::tunnel::connect(&tunnel.ticket))
         .await
         .expect("подключение по тикету не уложилось в срок")
         .expect("не удалось подключиться по тикету");

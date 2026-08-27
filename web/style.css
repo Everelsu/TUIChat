@@ -8,20 +8,22 @@
   --fg: #d6e4d8;
   --muted: #6b7d70;
   --line: #1f2a25;
-  --accent: #d97757;
-  --error: #ff6b6b;
-  --mention: #ffcc66;
+  --accent: #7a5cff;
+  --error: #ff5c7a;
+  --mention: #ffc24b;
   --mine: #131c18;
   /* Высота экранной клавиатуры: пересчитывается из JS. */
   --keyboard: 0px;
 
-  /* Палитра ников — те же шесть цветов, что в терминальном клиенте. */
-  --nick-0: #5ebab0;
-  --nick-1: #7eba80;
-  --nick-2: #d6ad60;
-  --nick-3: #b294d6;
-  --nick-4: #729fcf;
-  --nick-5: #d68080;
+  /* Палитра ников — те же восемь цветов, что в терминальном клиенте. */
+  --nick-0: #00d3f2;
+  --nick-1: #12c78f;
+  --nick-2: #ffc24b;
+  --nick-3: #b48cff;
+  --nick-4: #ff7abe;
+  --nick-5: #6bd0ff;
+  --nick-6: #ff8d6a;
+  --nick-7: #7ee2a8;
 
   /* Системные элементы — плеер, полосы прокрутки, выпадающие списки — должны
      совпадать с темой страницы, а не оставаться светлыми на тёмном. */
@@ -36,17 +38,19 @@
     --fg: #1f2320;
     --muted: #6f7770;
     --line: #ddd9cc;
-    --accent: #c05621;
+    --accent: #5b3fd6;
     --error: #b3261e;
     --mention: #8a6100;
     --mine: #eef1e8;
 
-    --nick-0: #067a86;
-    --nick-1: #1a7f3c;
+    --nick-0: #0678a6;
+    --nick-1: #0f7a5a;
     --nick-2: #8a6100;
-    --nick-3: #9c27b0;
-    --nick-4: #1f5fbf;
-    --nick-5: #c0392b;
+    --nick-3: #6b3fd0;
+    --nick-4: #b83a8a;
+    --nick-5: #1f5fbf;
+    --nick-6: #c04a20;
+    --nick-7: #1a7f3c;
 
     color-scheme: light;
   }

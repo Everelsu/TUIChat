@@ -1,0 +1,102 @@
+# Сборка готовых к запуску архивов по тегу.
+#
+# Тег вида `v0.1.0` — единственный запуск: гонять полную кросс-сборку на
+# каждый push значит ждать десять минут ради коммита в README. Проверки живут
+# в `ci.yml` и запускаются отдельно.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Ручной запуск: пригодится, чтобы собрать архивы из ветки, не заводя тег.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Одна упавшая платформа не должна отменять уже идущие: архив для
+      # Windows нужен, даже если не собралось на macOS.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Поставить Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      # Кеш реестра и target: без него каждая сборка тянет и компилирует
+      # заново весь QUIC-стек, а это минуты.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ALSA нужна rodio для звука: на голом раннере её заголовков нет, и
+      # сборка падает на этапе линковки, а не в коде.
+      - name: Заголовки ALSA
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Собрать
+        run: cargo build --release --target ${{ matrix.target }} --bin null_terminal --bin server
+
+      - name: Упаковать
+        shell: bash
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          name="null_terminal-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          out="target/${{ matrix.target }}/release"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "${out}/null_terminal.exe" "${out}/server.exe" "dist/${name}/"
+          else
+            cp "${out}/null_terminal" "${out}/server" "dist/${name}/"
+          fi
+          cp README.md "dist/${name}/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "${name}.zip" "${name}" > /dev/null
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: выложить в Releases
+    needs: build
+    runs-on: ubuntu-latest
+    # Только для тегов: ручной запуск собирает архивы, но релиз не трогает.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          generate_release_notes: true

@@ -2,6 +2,16 @@ use std::{io, io::Write as _, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use common::validate;
+use null_terminal::{
+    app::{Action, Command, State, update},
+    config::Config,
+    host::{self, Hosted},
+    images::Images,
+    launcher, media,
+    net::{self, NetConfig, NetHandle},
+    sound::Sound,
+    ui,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -15,19 +25,9 @@ use ratatui::{
     },
 };
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tui::{
-    app::{Action, Command, State, update},
-    config::Config,
-    host::{self, Hosted},
-    images::Images,
-    launcher, media,
-    net::{self, NetConfig, NetHandle},
-    sound::Sound,
-    ui,
-};
 
 #[derive(Parser)]
-#[command(about = "Терминальный клиент чата")]
+#[command(name = "null_terminal", about = "null_terminal — чат в терминале")]
 struct Args {
     /// Адрес WebSocket-эндпоинта сервера. По умолчанию — из настроек.
     #[arg(long)]
@@ -158,7 +158,7 @@ async fn main() -> io::Result<()> {
 /// иначе исчезает вместе с альтернативным экраном, и понять, что случилось,
 /// уже нельзя.
 fn log_crash(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
-    let path = tui::config::dir()?.join("crash.log");
+    let path = null_terminal::config::dir()?.join("crash.log");
     std::fs::create_dir_all(path.parent()?).ok()?;
 
     let mut file = std::fs::OpenOptions::new()
@@ -202,7 +202,9 @@ async fn run(
     state.colors = config
         .colors
         .iter()
-        .filter_map(|(nickname, value)| Some((nickname.clone(), tui::config::parse_color(value)?)))
+        .filter_map(|(nickname, value)| {
+            Some((nickname.clone(), null_terminal::config::parse_color(value)?))
+        })
         .collect();
     // Ссылки на вложения выводятся из адреса сокета — отдельного параметра
     // для них не нужно.
@@ -210,9 +212,24 @@ async fn run(
     state.media_base = net::media_base(&url);
     // Миниатюры прямо в ленте показываем только там, где терминал умеет
     // настоящую графику: полублоками картинка в десять строк — цветной шум.
-    state.inline_images = config
-        .inline_images
-        .unwrap_or_else(|| images.inline_friendly());
+    state.images_auto = images.inline_friendly();
+    state.images_choice = config.inline_images;
+    state.apply_images();
+    // Оформление: тема, колонка людей и то, где открываться заново. Всё это
+    // правится на вкладке «вид» и возвращается сюда при следующем запуске.
+    state.theme = null_terminal::theme::Theme::parse(&config.theme).unwrap_or_default();
+    state.sidebar = config.sidebar;
+    // Список устройств спрашиваем один раз: опрос звуковой подсистемы не
+    // бесплатный, а между двумя нажатиями стрелки наушники не меняются.
+    state.audio = audio_from(&config);
+    sound.set_gain(state.audio.volume);
+    let chosen = state.audio.output.clone();
+    if chosen.is_some() || state.audio.input.is_some() {
+        sound.use_devices(chosen.as_deref(), state.audio.input.clone());
+    }
+    // Из настроек, а не из аргумента запуска: `--terminal` — разовый обход,
+    // а на вкладке «вид» человек правит то, что останется.
+    state.terminal_mode = launcher::Mode::parse(&config.terminal).unwrap_or_default();
     // Адрес для второго человека показываем прямо в переписке: иначе первое,
     // что он спросит, — «а куда подключаться».
     if let Some(hosted) = &hosted {
@@ -223,7 +240,7 @@ async fn run(
 
     // На экране входа сразу тянем список комнат: человек видит, куда можно
     // зайти, ещё до того, как что-то введёт.
-    if matches!(state.screen, tui::app::Screen::Login(_)) {
+    if matches!(state.screen, null_terminal::app::Screen::Login(_)) {
         startup.push(Command::FetchRooms(state.media_base.clone()));
     }
 
@@ -239,10 +256,11 @@ async fn run(
         startup,
     );
 
-    // По тику крутится спиннер, бегут точки «печатает» и гаснет вспышка у
-    // новых сообщений. Восемь кадров в секунду — предел, за которым глаз
-    // разницы не видит, а процессор уже греется зря.
-    let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    // По тику крутится спиннер, бежит блик по заголовку, гаснет вспышка у
+    // новых сообщений и едет содержимое вкладки. Шестнадцать кадров в
+    // секунду: движение уже слитное, а рисование текстового экрана столько
+    // раз в секунду не стоит ничего заметного.
+    let mut ticker = tokio::time::interval(Duration::from_millis(60));
     terminal.draw(|frame| ui::draw(frame, &mut state, &mut images))?;
 
     loop {
@@ -357,9 +375,35 @@ fn apply(
                     actions.clone(),
                 ));
             }
+            // Уход в меню: соединение закрывается, и его запоздалые события
+            // не всплывают уже на главном экране.
+            Command::Disconnect => {
+                if let Some(previous) = network.take() {
+                    previous.close();
+                }
+            }
+            // Выбор устройств применяется на месте: услышать сигнал в новых
+            // наушниках — единственный способ убедиться, что выбрал те.
+            Command::Audio => {
+                let output = state.audio.output.clone();
+                let input = state.audio.input.clone();
+                sound.set_gain(state.audio.volume);
+                if sound.use_devices(output.as_deref(), input) {
+                    sound.chime();
+                } else if !state.audio.outputs.is_empty() {
+                    let _ = actions.send(Action::Notice(
+                        "не удалось открыть выбранные динамики".to_string(),
+                    ));
+                }
+            }
             Command::Open(url) => open_in_system_viewer(&url),
             Command::Fetch(id, url) => fetch_image(id, url, actions.clone()),
-            Command::Upload(path) => upload_file(state.media_base.clone(), path, actions.clone()),
+            Command::Upload(path) => upload_file(
+                state.media_base.clone(),
+                path,
+                state.upload_limit,
+                actions.clone(),
+            ),
             Command::ReadDir(path) => read_dir(path, actions.clone()),
             Command::PlayVoice(id, url) => fetch_voice(id, url, actions.clone()),
             Command::StopVoice => sound.stop_voice(),
@@ -395,6 +439,19 @@ fn save_config(config: &mut Config, state: &State, actions: &UnboundedSender<Act
     if state.last_dir.is_some() {
         config.last_dir = state.last_dir.clone();
     }
+    config.theme = state.theme.name().to_string();
+    config.sound_output = state.audio.output.clone().unwrap_or_default();
+    config.sound_input = state.audio.input.clone().unwrap_or_default();
+    config.chime = state.audio.chime;
+    config.volume = state.audio.volume as u8;
+    config.sidebar = state.sidebar;
+    config.inline_images = state.images_choice;
+    config.terminal = match state.terminal_mode {
+        launcher::Mode::Auto => "auto",
+        launcher::Mode::Always => "always",
+        launcher::Mode::Never => "never",
+    }
+    .to_string();
     config
         .colors
         .retain(|nickname, _| state.colors.contains_key(nickname));
@@ -406,6 +463,28 @@ fn save_config(config: &mut Config, state: &State, actions: &UnboundedSender<Act
         let _ = actions.send(Action::Notice(format!(
             "не удалось сохранить настройки: {err}"
         )));
+    }
+}
+
+/// Собирает состояние звука: что нашлось в системе и что из этого выбрано.
+///
+/// Выбранное устройство могло исчезнуть вместе с наушниками — тогда выбор
+/// молча становится системным: показывать в настройках имя того, чего больше
+/// нет, значит врать.
+fn audio_from(config: &Config) -> null_terminal::app::Audio {
+    let outputs = null_terminal::sound::outputs();
+    let inputs = null_terminal::sound::inputs();
+    let keep = |name: &str, list: &[String]| {
+        let name = name.trim();
+        (!name.is_empty() && list.iter().any(|found| found == name)).then(|| name.to_string())
+    };
+    null_terminal::app::Audio {
+        output: keep(&config.sound_output, &outputs),
+        input: keep(&config.sound_input, &inputs),
+        chime: config.chime,
+        volume: (config.volume as usize).min(null_terminal::sound::GAINS.len() - 1),
+        outputs,
+        inputs,
     }
 }
 
@@ -443,8 +522,9 @@ fn toggle_recording(sound: &mut Sound, state: &mut State, actions: UnboundedSend
     state.busy = Some("отправляю голосовое".to_string());
 
     let base = state.media_base.clone();
+    let limit = state.upload_limit;
     tokio::spawn(async move {
-        let result = media::upload_any(base, "голосовое.wav".to_string(), bytes).await;
+        let result = media::upload_any(base, "голосовое.wav".to_string(), bytes, limit).await;
         let _ = actions.send(Action::Uploaded(result));
     });
 }
@@ -496,7 +576,7 @@ fn fetch_rooms(base: String, actions: UnboundedSender<Action>) {
 fn read_dir(path: PathBuf, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
         let target = path.clone();
-        let work = tokio::task::spawn_blocking(move || tui::files::read_dir(&target));
+        let work = tokio::task::spawn_blocking(move || null_terminal::files::read_dir(&target));
         let result = work
             .await
             .unwrap_or_else(|err| Err(format!("чтение каталога сорвалось: {err}")));
@@ -536,7 +616,12 @@ fn save_file(url: String, destination: PathBuf, actions: UnboundedSender<Action>
 }
 
 /// Отправляет файл на сервер в отдельном потоке.
-fn upload_file(base: String, path: std::path::PathBuf, actions: UnboundedSender<Action>) {
+fn upload_file(
+    base: String,
+    path: std::path::PathBuf,
+    limit: usize,
+    actions: UnboundedSender<Action>,
+) {
     tokio::spawn(async move {
         // Читаем файл отдельным потоком: на сетевом диске это думает секундами.
         let read = tokio::task::spawn_blocking(move || {
@@ -552,7 +637,7 @@ fn upload_file(base: String, path: std::path::PathBuf, actions: UnboundedSender<
         .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")));
 
         let result = match read {
-            Ok((name, bytes)) => media::upload_any(base, name, bytes).await,
+            Ok((name, bytes)) => media::upload_any(base, name, bytes, limit).await,
             Err(reason) => Err(reason),
         };
         let _ = actions.send(Action::Uploaded(result));

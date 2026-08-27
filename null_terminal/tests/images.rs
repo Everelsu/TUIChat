@@ -1,5 +1,6 @@
 //! Показ картинки в терминале, от загрузки на сервер до пикселей.
 
+use common::validate;
 use std::{io::Cursor, sync::Arc};
 
 use server::{Hub, HubConfig};
@@ -57,8 +58,8 @@ async fn picture_travels_from_the_server_to_the_terminal() {
     // Скачивание и разбор блокируют, поэтому живут в отдельном потоке —
     // ровно так же, как в самом клиенте.
     let image = tokio::task::spawn_blocking(move || {
-        let bytes = tui::media::fetch(&url).expect("не удалось скачать");
-        tui::media::decode(&bytes).expect("не удалось разобрать")
+        let bytes = null_terminal::media::fetch(&url).expect("не удалось скачать");
+        null_terminal::media::decode(&bytes).expect("не удалось разобрать")
     })
     .await
     .unwrap();
@@ -66,7 +67,7 @@ async fn picture_travels_from_the_server_to_the_terminal() {
     assert_eq!((image.width(), image.height()), (64, 32));
 
     // И превращается в строки полублоков: два ряда пикселей на строку.
-    let lines = tui::media::to_lines(&image, 64, 32);
+    let lines = null_terminal::media::to_lines(&image, 64, 32);
     assert_eq!(lines.len(), 16);
     assert_eq!(lines[0].spans.len(), 64);
 }
@@ -76,7 +77,7 @@ async fn missing_picture_is_reported_not_panicked() {
     let base = start_server().await;
     let url = format!("{base}/media/{}", uuid::Uuid::new_v4());
 
-    let error = tokio::task::spawn_blocking(move || tui::media::fetch(&url).unwrap_err())
+    let error = tokio::task::spawn_blocking(move || null_terminal::media::fetch(&url).unwrap_err())
         .await
         .unwrap();
 
@@ -91,10 +92,12 @@ async fn picture_can_be_sent_from_the_terminal() {
     std::fs::write(&path, png(32, 16)).unwrap();
 
     let sent = path.clone();
-    let attachment = tokio::task::spawn_blocking(move || tui::media::upload(&base, &sent))
-        .await
-        .unwrap()
-        .expect("файл не загрузился");
+    let attachment = tokio::task::spawn_blocking(move || {
+        null_terminal::media::upload(&base, &sent, validate::MAX_UPLOAD_BYTES)
+    })
+    .await
+    .unwrap()
+    .expect("файл не загрузился");
 
     assert_eq!(attachment.mime, "image/png");
     assert_eq!(attachment.kind, common::AttachmentKind::Image);
@@ -110,10 +113,12 @@ async fn oversized_file_is_refused_with_a_readable_reason() {
     std::fs::write(&path, vec![0u8; common::MAX_UPLOAD_BYTES + 1]).unwrap();
 
     let sent = path.clone();
-    let error = tokio::task::spawn_blocking(move || tui::media::upload(&base, &sent))
-        .await
-        .unwrap()
-        .unwrap_err();
+    let error = tokio::task::spawn_blocking(move || {
+        null_terminal::media::upload(&base, &sent, validate::MAX_UPLOAD_BYTES)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
 
     // Отказ должен объяснять причину, а не показывать код ответа.
     assert!(error.contains("слишком большой"), "пришло: {error}");

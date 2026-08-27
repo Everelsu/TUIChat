@@ -382,6 +382,7 @@ pub fn app_with_hub(hub: Arc<Hub>) -> Router {
 }
 
 pub fn app_with_state(state: AppState) -> Router {
+    let limit = state.media.limit();
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(script))
@@ -395,8 +396,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/upload",
             // Свой потолок на тело: по умолчанию axum рубит запросы на 2 МБ,
-            // и картинка с телефона в него не влезет.
-            post(upload).layer(DefaultBodyLimit::max(validate::MAX_UPLOAD_BYTES)),
+            // и картинка с телефона в него не влезет. Берём его у хранилища —
+            // иначе слой и проверка при записи разошлись бы, и большой файл
+            // обрывался бы без объяснения.
+            post(upload).layer(DefaultBodyLimit::max(limit)),
         )
         .route("/media/{id}", get(media_file))
         .with_state(state)
@@ -541,7 +544,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let id = Uuid::new_v4();
     let (outbox, mut inbox) = mpsc::unbounded_channel();
 
-    let Some(session) = join_phase(hub, id, &outbox, &mut sink, &mut stream).await else {
+    let Some(session) = join_phase(
+        hub,
+        id,
+        &outbox,
+        &mut sink,
+        &mut stream,
+        state.media.limit(),
+    )
+    .await
+    else {
         let _ = sink.close().await;
         return;
     };
@@ -602,6 +614,9 @@ async fn join_phase(
     outbox: &Outbox,
     sink: &mut Sink,
     stream: &mut Stream,
+    // Потолок вложения этого сервера: клиент узнаёт его вместе с приветствием
+    // и не гонит по сети то, что всё равно отвергнут.
+    media_limit: usize,
 ) -> Option<Session> {
     // Дедлайн на всю фазу, а не на отдельный кадр: иначе клиент может вечно
     // слать мусор, каждый раз сбрасывая таймер.
@@ -704,6 +719,7 @@ async fn join_phase(
             nickname,
             users: joined.others,
             history: joined.history,
+            upload_limit: media_limit as u64,
         };
         if send(sink, &welcome).await.is_err() {
             hub.leave(&room, id);

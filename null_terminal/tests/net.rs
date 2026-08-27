@@ -6,15 +6,15 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use common::{ClientMessage, ServerMessage};
+use null_terminal::{
+    app::{Action, NetEvent},
+    net::{self, NetConfig, NetHandle},
+};
 use server::{Hub, HubConfig};
 use tokio::{
     net::TcpListener,
     sync::mpsc::{UnboundedReceiver, unbounded_channel},
     time::timeout,
-};
-use tui::{
-    app::{Action, NetEvent},
-    net::{self, NetConfig, NetHandle},
 };
 
 /// Быстрые таймауты: иначе тест на реконнект шёл бы секундами.

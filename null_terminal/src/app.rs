@@ -16,7 +16,7 @@ use common::{
 use image::RgbImage;
 use ratatui::style::Color;
 
-use crate::{config, files::FileEntry};
+use crate::{config, files::FileEntry, theme::Theme};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use uuid::Uuid;
 
@@ -41,6 +41,9 @@ pub const HELP: &[&str] = &[
     "щелчок по вложению — открыть его",
     "перетащить файл в окно — отправить его",
     "F1 — эта справка",
+    "esc — выйти из комнаты в меню",
+    "ctrl+q — закрыть программу",
+    "ctrl+p — колонка с людьми справа",
     "",
     "/join <комната> — перейти в другую комнату",
     "/rooms — показать комнаты на сервере",
@@ -53,15 +56,16 @@ pub const HELP: &[&str] = &[
     "/open — открыть вложение внешней программой",
     "/color [ник] <цвет> — цвет ника, «-» сбрасывает",
     "/host [порт] — поднять свой сервер и позвать друга",
+    "/menu — вернуться в меню",
     "/clear — очистить историю на экране",
     "/quit — выход",
     "//текст — отправить текст со слэша в начале",
 ];
 
 /// Команды для дополнения по Tab. Порядок — как в справке.
-const COMMANDS: [&str; 15] = [
+const COMMANDS: [&str; 16] = [
     "/help", "/join", "/rooms", "/nick", "/send", "/view", "/play", "/stop", "/save", "/open",
-    "/color", "/clear", "/host", "/rec", "/quit",
+    "/color", "/clear", "/host", "/menu", "/rec", "/quit",
 ];
 
 /// Однострочное поле ввода: текст и позиция курсора.
@@ -306,15 +310,221 @@ pub enum Field {
     /// Адрес сервера. Без него подключиться к чужому серверу можно было бы
     /// только флагом при запуске — то есть никак, если клиент уже открыт.
     Server,
+    /// Порт своего сервера на вкладке «поднять».
+    Port,
 }
 
-/// Экран входа. Он же — место, куда клиент возвращается, если ник занят:
-/// человек правит одно поле и пробует снова, не перезапуская программу.
-#[derive(Debug, Clone, Default)]
+/// Вкладки главного экрана.
+///
+/// Раньше вход был единственной формой, а всё остальное пряталось за
+/// командами со слэшем: поднять свой сервер можно было только из чата, куда
+/// ещё надо было как-то попасть. Вкладки показывают все три входа в чат
+/// сразу — зайти, поднять, настроить, — и учить для этого нечего.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HomeTab {
+    #[default]
+    Join,
+    Host,
+    Look,
+    Sound,
+    Help,
+}
+
+impl HomeTab {
+    pub const ALL: [HomeTab; 5] = [
+        HomeTab::Join,
+        HomeTab::Host,
+        HomeTab::Look,
+        HomeTab::Sound,
+        HomeTab::Help,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            HomeTab::Join => "войти",
+            HomeTab::Host => "поднять",
+            HomeTab::Look => "вид",
+            HomeTab::Sound => "звук",
+            HomeTab::Help => "справка",
+        }
+    }
+
+    /// Значок вкладки. Он же метка: по нему вкладка узнаётся быстрее, чем
+    /// по слову, когда взгляд бежит по строке.
+    pub fn icon(self) -> &'static str {
+        match self {
+            HomeTab::Join => "◆",
+            HomeTab::Host => "✦",
+            HomeTab::Look => "◐",
+            HomeTab::Sound => "♪",
+            HomeTab::Help => "?",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        HomeTab::ALL
+            .iter()
+            .position(|&tab| tab == self)
+            .unwrap_or(0)
+    }
+
+    fn shift(self, back: bool) -> Self {
+        let len = HomeTab::ALL.len();
+        let next = if back {
+            self.index() + len - 1
+        } else {
+            self.index() + 1
+        };
+        HomeTab::ALL[next % len]
+    }
+
+    /// Поля, по которым ходят стрелки на этой вкладке.
+    fn fields(self) -> &'static [Field] {
+        match self {
+            HomeTab::Join => &[Field::Nickname, Field::Room, Field::Server],
+            HomeTab::Host => &[Field::Nickname, Field::Room, Field::Port],
+            HomeTab::Look | HomeTab::Sound | HomeTab::Help => &[],
+        }
+    }
+}
+
+/// Строка настроек на вкладке «вид».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    Theme,
+    Images,
+    Sidebar,
+    Terminal,
+}
+
+impl Setting {
+    pub const ALL: [Setting; 4] = [
+        Setting::Theme,
+        Setting::Images,
+        Setting::Sidebar,
+        Setting::Terminal,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Setting::Theme => "тема",
+            Setting::Images => "картинки в ленте",
+            Setting::Sidebar => "панель людей",
+            Setting::Terminal => "свой терминал",
+        }
+    }
+
+    /// Строка под настройкой: чем выбор обернётся на деле.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Setting::Theme => "цвет рамок, вкладок и своих сообщений",
+            Setting::Images => "показывать присланное прямо в переписке",
+            Setting::Sidebar => "кто в комнате — колонкой справа, ctrl+p",
+            Setting::Terminal => "открываться заново там, где есть цвет и графика",
+        }
+    }
+}
+
+/// Строка настроек на вкладке «звук».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundSetting {
+    Output,
+    Input,
+    Chime,
+    Volume,
+}
+
+impl SoundSetting {
+    pub const ALL: [SoundSetting; 4] = [
+        SoundSetting::Output,
+        SoundSetting::Input,
+        SoundSetting::Chime,
+        SoundSetting::Volume,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            SoundSetting::Output => "динамики",
+            SoundSetting::Input => "микрофон",
+            SoundSetting::Chime => "звоночек",
+            SoundSetting::Volume => "громкость",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SoundSetting::Output => "куда играют голосовые и звоночек",
+            SoundSetting::Input => "с чего пишется голосовое по F2",
+            SoundSetting::Chime => "сигнал, когда в комнате назвали ваш ник",
+            SoundSetting::Volume => "громкость сигнала, голосовых не касается",
+        }
+    }
+}
+
+/// Звук: что нашлось в системе и что из этого выбрано.
+#[derive(Debug, Clone)]
+pub struct Audio {
+    /// Имена устройств, найденных при запуске. Список не обновляется на ходу:
+    /// опрос звуковой подсистемы не бесплатный, а наушники между двумя
+    /// нажатиями стрелки обычно не меняются.
+    pub outputs: Vec<String>,
+    pub inputs: Vec<String>,
+    /// Что выбрано. `None` — «как в системе»: этот выбор переживает и смену
+    /// наушников, и перезапуск, поэтому он же и по умолчанию.
+    pub output: Option<String>,
+    pub input: Option<String>,
+    /// Подавать ли сигнал при упоминании.
+    pub chime: bool,
+    /// Ступень громкости сигнала.
+    pub volume: usize,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self {
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            output: None,
+            input: None,
+            chime: true,
+            volume: 1,
+        }
+    }
+}
+
+/// Листает выбор по кругу: «как в системе», а дальше найденные устройства.
+fn cycle_device(list: &[String], current: &Option<String>, back: bool) -> Option<String> {
+    if list.is_empty() {
+        return None;
+    }
+    let at = match current {
+        None => 0,
+        Some(name) => list
+            .iter()
+            .position(|found| found == name)
+            .map_or(0, |i| i + 1),
+    };
+    let len = list.len() + 1;
+    let next = if back { at + len - 1 } else { at + 1 };
+    match next % len {
+        0 => None,
+        i => Some(list[i - 1].clone()),
+    }
+}
+
+/// Главный экран: вход, свой сервер, настройки и справка.
+///
+/// Он же — место, куда клиент возвращается, если ник занят: человек правит
+/// одно поле и пробует снова, не перезапуская программу.
+#[derive(Debug, Clone)]
 pub struct Login {
+    pub tab: HomeTab,
     pub nickname: Input,
     pub room: Input,
     pub server: Input,
+    /// Порт для своего сервера. Отдельным полем, а не аргументом запуска:
+    /// занятый порт виден сразу, и поменять его можно не выходя из клиента.
+    pub port: Input,
     pub field: Field,
     pub error: Option<String>,
     /// Комнаты, живущие сейчас на сервере. Человек выбирает из списка
@@ -326,6 +536,38 @@ pub struct Login {
     /// Что показать над списком: «спрашиваю сервер…» или причина, по которой
     /// список пуст. Пустой список без пояснения выглядит как поломка.
     pub rooms_note: Option<String>,
+    /// Выбранная строка на вкладке «вид».
+    pub setting: usize,
+    /// Чем экран сейчас занят: поднимает сервер, ждёт ответа. Пока не пусто,
+    /// Enter ничего не делает — иначе нетерпеливое нажатие подняло бы второй
+    /// сервер на том же порту.
+    pub busy: Option<String>,
+    /// Когда экран открылся: по метке проигрывается появление заголовка.
+    pub opened: Instant,
+    /// Когда последний раз переключили вкладку: содержимое въезжает.
+    pub switched: Instant,
+}
+
+impl Default for Login {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            tab: HomeTab::default(),
+            nickname: Input::default(),
+            room: Input::default(),
+            server: Input::default(),
+            port: Input::new(DEFAULT_PORT.to_string()),
+            field: Field::default(),
+            error: None,
+            rooms: Vec::new(),
+            rooms_selected: None,
+            rooms_note: None,
+            setting: 0,
+            busy: None,
+            opened: now,
+            switched: now,
+        }
+    }
 }
 
 impl Login {
@@ -334,6 +576,7 @@ impl Login {
             Field::Nickname => &mut self.nickname,
             Field::Room => &mut self.room,
             Field::Server => &mut self.server,
+            Field::Port => &mut self.port,
         }
     }
 
@@ -342,41 +585,76 @@ impl Login {
             Field::Nickname => validate::MAX_NICKNAME_CHARS,
             Field::Room => validate::MAX_ROOM_CHARS,
             Field::Server => validate::MAX_TEXT_CHARS,
+            // Пять цифр — весь диапазон портов. Больше просто не бывает.
+            Field::Port => 5,
+        }
+    }
+
+    /// Переключает вкладку и заодно чинит фокус: поле с прошлой вкладки на
+    /// новой может и не существовать.
+    fn switch_tab(&mut self, back: bool) {
+        self.tab = self.tab.shift(back);
+        self.switched = Instant::now();
+        self.error = None;
+        self.rooms_selected = None;
+        // У каждого раздела свой список строк: остаться на четвёртой,
+        // перейдя туда, где их две, значит выбрать не то.
+        self.setting = 0;
+        if let Some(first) = self.tab.fields().first()
+            && !self.tab.fields().contains(&self.field)
+        {
+            self.field = *first;
         }
     }
 
     fn next_field(&mut self, back: bool) {
-        self.field = match (self.field, back) {
-            (Field::Nickname, false) => Field::Room,
-            (Field::Room, false) => Field::Server,
-            (Field::Server, false) => Field::Nickname,
-            (Field::Nickname, true) => Field::Server,
-            (Field::Room, true) => Field::Nickname,
-            (Field::Server, true) => Field::Room,
-        };
-    }
-
-    /// Стрелка вниз: заходит в список комнат и ведёт по нему. Пока список пуст,
-    /// стрелки, как и раньше, просто перебирают поля формы.
-    fn select_down(&mut self) {
-        if self.rooms.is_empty() {
-            self.next_field(false);
+        let fields = self.tab.fields();
+        if fields.is_empty() {
             return;
         }
-        let next = match self.rooms_selected {
-            None => 0,
-            Some(i) => (i + 1).min(self.rooms.len() - 1),
-        };
-        self.rooms_selected = Some(next);
+        let at = fields.iter().position(|&f| f == self.field).unwrap_or(0);
+        let next = if back { at + fields.len() - 1 } else { at + 1 };
+        self.field = fields[next % fields.len()];
+    }
+
+    /// Стрелка вниз ведёт сверху вниз по всему, что на вкладке есть: сначала
+    /// поля, потом список комнат. Одна дорожка вместо двух — не нужно помнить,
+    /// какая клавиша куда переводит.
+    fn select_down(&mut self) {
+        match self.tab {
+            HomeTab::Look => {
+                self.setting = (self.setting + 1).min(Setting::ALL.len() - 1);
+            }
+            HomeTab::Sound => {
+                self.setting = (self.setting + 1).min(SoundSetting::ALL.len() - 1);
+            }
+            HomeTab::Join => {
+                let fields = self.tab.fields();
+                match self.rooms_selected {
+                    Some(i) => self.rooms_selected = Some((i + 1).min(self.rooms.len() - 1)),
+                    // С последнего поля спускаемся в список, если он есть.
+                    None if self.field == *fields.last().unwrap() && !self.rooms.is_empty() => {
+                        self.rooms_selected = Some(0);
+                    }
+                    None => self.next_field(false),
+                }
+            }
+            HomeTab::Host => self.next_field(false),
+            HomeTab::Help => {}
+        }
     }
 
     /// Стрелка вверх: с первой строки списка возвращает фокус на форму.
     fn select_up(&mut self) {
-        match self.rooms_selected {
-            Some(0) | None if self.rooms.is_empty() => self.next_field(true),
-            Some(0) => self.rooms_selected = None,
-            Some(i) => self.rooms_selected = Some(i - 1),
-            None => self.next_field(true),
+        match self.tab {
+            HomeTab::Look | HomeTab::Sound => self.setting = self.setting.saturating_sub(1),
+            HomeTab::Join => match self.rooms_selected {
+                Some(0) => self.rooms_selected = None,
+                Some(i) => self.rooms_selected = Some(i - 1),
+                None => self.next_field(true),
+            },
+            HomeTab::Host => self.next_field(true),
+            HomeTab::Help => {}
         }
     }
 
@@ -387,8 +665,23 @@ impl Login {
             .and_then(|i| self.rooms.get(i))
             .map(|room| room.name.clone())
     }
+
+    pub fn current_setting(&self) -> Setting {
+        Setting::ALL[self.setting.min(Setting::ALL.len() - 1)]
+    }
+
+    pub fn current_sound(&self) -> SoundSetting {
+        SoundSetting::ALL[self.setting.min(SoundSetting::ALL.len() - 1)]
+    }
 }
 
+/// Порт, который предлагается для своего сервера.
+pub const DEFAULT_PORT: u16 = 8080;
+
+/// Экран в состоянии ровно один, и живёт он столько же, сколько сам клиент:
+/// прятать форму входа в Box значило бы платить разыменованием на каждой
+/// отрисовке ради трёхсот байт, которых всё равно ровно один экземпляр.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Screen {
     Login(Login),
@@ -469,6 +762,10 @@ pub enum Command {
         url: String,
         destination: std::path::PathBuf,
     },
+    /// Разорвать соединение и никуда не подключаться: так уходят в меню.
+    Disconnect,
+    /// Переоткрыть звуковые устройства по выбору из настроек.
+    Audio,
     /// Звоночек терминала: единственное уведомление, доступное из TUI.
     Bell,
     /// Записать настройки на диск: ник, комнату и цвета.
@@ -582,7 +879,25 @@ pub struct State {
     pub playing_voice: Option<(Uuid, Instant)>,
     /// Умеет ли терминал настоящую графику. Полублоками миниатюра в несколько
     /// строк превращается в цветной шум, поэтому там остаётся строка с именем.
+    ///
+    /// Считается из двух вещей ниже и обновляется `apply_images`.
     pub inline_images: bool,
+    /// Что человек выбрал в настройках. `None` — «решай сам».
+    pub images_choice: Option<bool>,
+    /// Что клиент решил сам, посмотрев на терминал.
+    pub images_auto: bool,
+    /// Тема оформления. Живёт в состоянии, а не в глобальной переменной,
+    /// чтобы отрисовку можно было проверить обычным тестом.
+    pub theme: Theme,
+    /// Показывать ли колонку с людьми справа от переписки.
+    pub sidebar: bool,
+    /// Перезапускать ли клиент в нормальном терминале. Здесь — чтобы вкладка
+    /// «вид» могла это менять; работает настройка при следующем запуске.
+    pub terminal_mode: crate::launcher::Mode,
+    /// Звуковые устройства и выбор человека.
+    pub audio: Audio,
+    /// Какой файл согласен принять сервер, к которому мы подключены.
+    pub upload_limit: usize,
     /// Кто сейчас печатает и когда об этом сказали в последний раз.
     pub typing: HashMap<Uuid, (String, Instant)>,
     /// Когда мы сами последний раз сообщили, что печатаем.
@@ -619,9 +934,11 @@ pub struct State {
     pub viewer: Option<Viewer>,
     /// Открытый обзор файлов.
     pub browser: Option<Browser>,
-    /// Открыта ли справка. Она тоже поверх: одиннадцать строк в ленте
-    /// выталкивают из виду сам разговор, ради которого её и открывали.
+    /// Открыта ли справка. Она тоже поверх: три десятка строк в ленте
+    /// вытолкнули бы из виду сам разговор, ради которого её и открывали.
     pub help: bool,
+    /// На сколько строк справка пролистана: в окно она целиком не влезает.
+    pub help_scroll: usize,
     pub should_quit: bool,
 }
 
@@ -657,12 +974,7 @@ impl State {
             screen: Screen::Login(Login {
                 nickname: Input::new(nickname.clone().unwrap_or_default()),
                 room: Input::new(room.clone()),
-                server: Input::default(),
-                field: Field::Nickname,
-                error: None,
-                rooms: Vec::new(),
-                rooms_selected: None,
-                rooms_note: None,
+                ..Login::default()
             }),
             nickname: String::new(),
             room: room.clone(),
@@ -676,6 +988,13 @@ impl State {
             waveforms: HashMap::new(),
             playing_voice: None,
             inline_images: false,
+            images_choice: None,
+            images_auto: false,
+            theme: Theme::default(),
+            sidebar: false,
+            terminal_mode: crate::launcher::Mode::default(),
+            audio: Audio::default(),
+            upload_limit: validate::MAX_UPLOAD_BYTES,
             typing: HashMap::new(),
             typing_sent: None,
             status: Status::Connecting { attempt: 0 },
@@ -698,6 +1017,7 @@ impl State {
             viewer: None,
             browser: None,
             help: false,
+            help_scroll: 0,
             should_quit: false,
         };
 
@@ -743,6 +1063,114 @@ impl State {
 
     pub fn is_online(&self) -> bool {
         matches!(self.status, Status::Online)
+    }
+
+    /// Пересчитывает, показывать ли картинки прямо в ленте: выбор человека
+    /// перевешивает догадку клиента, но пока выбора нет — работает догадка.
+    pub fn apply_images(&mut self) {
+        self.inline_images = self.images_choice.unwrap_or(self.images_auto);
+    }
+
+    /// Значение настройки строкой — для экрана и для файла настроек.
+    pub fn setting_value(&self, setting: Setting) -> &'static str {
+        match setting {
+            Setting::Theme => self.theme.title(),
+            Setting::Images => match self.images_choice {
+                None => "авто",
+                Some(true) => "показывать",
+                Some(false) => "не надо",
+            },
+            Setting::Sidebar => {
+                if self.sidebar {
+                    "показывать"
+                } else {
+                    "спрятана"
+                }
+            }
+            Setting::Terminal => match self.terminal_mode {
+                crate::launcher::Mode::Auto => "авто",
+                crate::launcher::Mode::Always => "всегда",
+                crate::launcher::Mode::Never => "никогда",
+            },
+        }
+    }
+
+    /// Значение звуковой настройки строкой.
+    pub fn sound_value(&self, setting: SoundSetting) -> String {
+        match setting {
+            SoundSetting::Output => match &self.audio.output {
+                Some(name) => name.clone(),
+                None => "как в системе".to_string(),
+            },
+            SoundSetting::Input => match &self.audio.input {
+                Some(name) => name.clone(),
+                None => "как в системе".to_string(),
+            },
+            SoundSetting::Chime => if self.audio.chime {
+                "включён"
+            } else {
+                "выключен"
+            }
+            .to_string(),
+            SoundSetting::Volume => match self.audio.volume {
+                0 => "тихо",
+                2 => "громко",
+                _ => "средне",
+            }
+            .to_string(),
+        }
+    }
+
+    /// Листает звуковую настройку.
+    fn shift_sound(&mut self, setting: SoundSetting, back: bool) {
+        match setting {
+            SoundSetting::Output => {
+                self.audio.output = cycle_device(&self.audio.outputs, &self.audio.output, back);
+            }
+            SoundSetting::Input => {
+                self.audio.input = cycle_device(&self.audio.inputs, &self.audio.input, back);
+            }
+            SoundSetting::Chime => self.audio.chime = !self.audio.chime,
+            SoundSetting::Volume => {
+                let steps = crate::sound::GAINS.len();
+                let at = self.audio.volume.min(steps - 1);
+                let next = if back { at + steps - 1 } else { at + 1 };
+                self.audio.volume = next % steps;
+            }
+        }
+    }
+
+    /// Листает значение настройки. Стрелки ходят в обе стороны, Enter — та же
+    /// стрелка вправо: перебирать три значения по кругу проще, чем помнить,
+    /// какая клавиша что открывает.
+    fn shift_setting(&mut self, setting: Setting, back: bool) {
+        match setting {
+            Setting::Theme => self.theme = self.theme.shift(back),
+            Setting::Images => {
+                // Три состояния по кругу: авто → показывать → не надо.
+                self.images_choice = match (self.images_choice, back) {
+                    (None, false) => Some(true),
+                    (Some(true), false) => Some(false),
+                    (Some(false), false) => None,
+                    (None, true) => Some(false),
+                    (Some(false), true) => Some(true),
+                    (Some(true), true) => None,
+                };
+                self.apply_images();
+            }
+            Setting::Sidebar => self.sidebar = !self.sidebar,
+            Setting::Terminal => {
+                use crate::launcher::Mode;
+                self.terminal_mode = match (self.terminal_mode, back) {
+                    (Mode::Auto, false) => Mode::Always,
+                    (Mode::Always, false) => Mode::Never,
+                    (Mode::Never, false) => Mode::Auto,
+                    (Mode::Auto, true) => Mode::Never,
+                    (Mode::Never, true) => Mode::Always,
+                    (Mode::Always, true) => Mode::Auto,
+                };
+            }
+        }
     }
 
     fn push(&mut self, entry: Entry) {
@@ -985,7 +1413,15 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
         }
         Action::Notice(text) => {
             state.busy = None;
-            state.system(SystemKind::Error, text);
+            // На главном экране беда относится к форме: показываем её там же,
+            // где человек набирал, — в ленту он ещё даже не заходил.
+            match &mut state.screen {
+                Screen::Login(login) => {
+                    login.busy = None;
+                    login.error = Some(text);
+                }
+                Screen::Chat => state.system(SystemKind::Error, text),
+            }
             Vec::new()
         }
         Action::Info(text) => {
@@ -998,6 +1434,10 @@ pub fn update(state: &mut State, action: Action) -> Vec<Command> {
         }
         Action::Hosted { url, lines } => {
             state.busy = None;
+            // Сервер встал: теперь переход в переписку осмыслен.
+            if matches!(state.screen, Screen::Login(_)) {
+                state.screen = Screen::Chat;
+            }
             for line in lines {
                 state.system(SystemKind::Info, line);
             }
@@ -1170,7 +1610,9 @@ fn edit_key(input: &mut Input, key: KeyEvent, limit: usize) -> bool {
 
 fn on_login_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if key.code == KeyCode::Esc || (ctrl && matches!(key.code, KeyCode::Char('c' | 'd'))) {
+    // Выход — только явным сочетанием. Esc за годы стал клавишей «назад», и
+    // закрывать по ней программу означает терять разговор из-за промаха.
+    if ctrl && matches!(key.code, KeyCode::Char('c' | 'd' | 'q')) {
         state.should_quit = true;
         return vec![Command::Quit];
     }
@@ -1179,14 +1621,42 @@ fn on_login_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         return Vec::new();
     };
 
+    // Esc на главном экране возвращает к первой вкладке — той, ради которой
+    // клиент и открывают.
+    if key.code == KeyCode::Esc {
+        if login.tab != HomeTab::Join {
+            login.tab = HomeTab::Join;
+            login.switched = Instant::now();
+            login.field = Field::Nickname;
+            login.error = None;
+        }
+        return Vec::new();
+    }
+
+    let tab = login.tab;
     match key.code {
-        KeyCode::Enter => return login_submit(state),
-        // Tab — по полям формы; стрелки — по списку комнат (а когда список
-        // пуст, они тоже перебирают поля, как раньше).
-        KeyCode::Tab => login.next_field(false),
-        KeyCode::BackTab => login.next_field(true),
+        KeyCode::Enter => return home_submit(state),
+        // Tab листает вкладки, стрелки ходят внутри вкладки. Так у клавиш нет
+        // двойного смысла: Tab всегда переключает раздел, ↑↓ всегда выбирают
+        // строку, ←→ всегда двигают курсор в поле.
+        KeyCode::Tab => login.switch_tab(false),
+        KeyCode::BackTab => login.switch_tab(true),
         KeyCode::Down => login.select_down(),
         KeyCode::Up => login.select_up(),
+        // На вкладке «вид» стрелки вбок листают значение настройки, на
+        // остальных — двигают курсор по тексту.
+        KeyCode::Left | KeyCode::Right if tab == HomeTab::Look => {
+            let setting = login.current_setting();
+            state.shift_setting(setting, key.code == KeyCode::Left);
+            return vec![Command::SaveConfig];
+        }
+        KeyCode::Left | KeyCode::Right if tab == HomeTab::Sound => {
+            let setting = login.current_sound();
+            state.shift_sound(setting, key.code == KeyCode::Left);
+            // Устройство переключаем сразу и подаём сигнал: услышать, куда
+            // ушёл звук, — единственный способ проверить выбор.
+            return vec![Command::Audio, Command::SaveConfig];
+        }
         // Ctrl+R — обновить список комнат с адреса, что сейчас в поле.
         KeyCode::Char('r') if ctrl => {
             login.rooms_note = Some("спрашиваю сервер о комнатах…".to_string());
@@ -1195,15 +1665,130 @@ fn on_login_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
                 .map(|command| vec![command])
                 .unwrap_or_default();
         }
+        _ if tab.fields().is_empty() => {}
         _ => {
             // Правка любого поля означает «войду по набранному»: снимаем выбор
             // из списка, иначе Enter увёл бы не туда, куда смотрит человек.
             login.rooms_selected = None;
             let limit = login.limit();
+            // В порт пускаем только цифры: буква в нём всё равно означала бы
+            // ошибку, а поймать её при вводе честнее, чем при попытке поднять.
+            // Сочетания с ctrl проверку не проходят — они не набирают текст,
+            // а правят его целиком, и ctrl+u должен чистить поле как везде.
+            if login.field == Field::Port
+                && !ctrl
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_ascii_digit())
+            {
+                return Vec::new();
+            }
             edit_key(login.active(), key, limit);
         }
     }
     Vec::new()
+}
+
+/// Возвращает на главный экран, разорвав соединение.
+///
+/// Именно разорвав: «главное меню» — это место, где выбирают, куда идти, и
+/// висеть в комнате, стоя в меню, значит показывать другим, что человек тут,
+/// когда его тут нет. Переписка при этом остаётся в памяти — вернувшись в ту
+/// же комнату, он увидит, на чём остановились.
+fn to_home(state: &mut State) -> Vec<Command> {
+    state.screen = Screen::Login(Login {
+        nickname: Input::new(state.nickname.clone()),
+        room: Input::new(state.room.clone()),
+        server: Input::new(state.server.clone()),
+        ..Login::default()
+    });
+    state.status = Status::Connecting { attempt: 0 };
+    state.users.clear();
+    state.typing.clear();
+    state.picking = None;
+    state.replying = None;
+    state.search = None;
+    state.help = false;
+    state.viewer = None;
+    state.browser = None;
+    state.busy = None;
+
+    let mut commands = vec![Command::Disconnect, Command::SaveConfig];
+    // Заодно освежаем список комнат: адрес известен, а видеть, куда можно
+    // зайти, полезно сразу.
+    commands.extend(rooms_fetch(&state.server, &state.server));
+    commands
+}
+
+/// Enter на главном экране: делает то, что написано на вкладке.
+fn home_submit(state: &mut State) -> Vec<Command> {
+    let Screen::Login(login) = &state.screen else {
+        return Vec::new();
+    };
+    if login.busy.is_some() {
+        return Vec::new();
+    }
+    match login.tab {
+        HomeTab::Join => login_submit(state),
+        HomeTab::Host => host_submit(state),
+        HomeTab::Look => {
+            let setting = login.current_setting();
+            state.shift_setting(setting, false);
+            vec![Command::SaveConfig]
+        }
+        HomeTab::Sound => {
+            let setting = login.current_sound();
+            state.shift_sound(setting, false);
+            vec![Command::Audio, Command::SaveConfig]
+        }
+        HomeTab::Help => Vec::new(),
+    }
+}
+
+/// Поднимает сервер прямо здесь и входит в него же.
+///
+/// Ник и комната проверяются теми же правилами, что и при обычном входе:
+/// поднять комнату и упереться в «ник занят» — худший способ узнать, что ник
+/// не годится.
+fn host_submit(state: &mut State) -> Vec<Command> {
+    let Screen::Login(login) = &mut state.screen else {
+        return Vec::new();
+    };
+
+    let nickname = match validate::clean_nickname(&login.nickname.text) {
+        Ok(nickname) => nickname,
+        Err(err) => {
+            login.field = Field::Nickname;
+            login.error = Some(err.to_string());
+            return Vec::new();
+        }
+    };
+    let room = match validate::clean_room(&login.room.text) {
+        Ok(room) => room,
+        Err(err) => {
+            login.field = Field::Room;
+            login.error = Some(err.to_string());
+            return Vec::new();
+        }
+    };
+    let port = match login.port.text.trim().parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => {
+            login.field = Field::Port;
+            login.error = Some("порт — число от 1 до 65535".to_string());
+            return Vec::new();
+        }
+    };
+
+    state.nickname = nickname;
+    state.room = room;
+    state.forget_room();
+    // Экран не меняем: занятый порт — обычное дело, и узнать об этом человек
+    // должен там же, где его набрал, а не в пустой переписке без связи.
+    if let Screen::Login(login) = &mut state.screen {
+        login.error = None;
+        login.busy = Some(format!("поднимаю сервер на порту {port}"));
+    }
+    // Подключение придёт следом: сервер сам скажет свой адрес, когда встанет.
+    vec![Command::Host(port)]
 }
 
 /// Команда «спросить список комнат» для адреса, что сейчас на экране входа.
@@ -1539,7 +2124,7 @@ fn on_search_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
             state.search = None;
             return Vec::new();
         }
-        KeyCode::Char('c' | 'd') if ctrl => {
+        KeyCode::Char('c' | 'd' | 'q') if ctrl => {
             state.should_quit = true;
             return vec![Command::Quit];
         }
@@ -1692,10 +2277,17 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
     }
 
     if state.help {
-        // Справку закрывает что угодно осмысленное: искать нужную клавишу,
-        // чтобы убрать подсказку, — отдельное издевательство.
-        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
-            state.help = false;
+        // Стрелки листают: список длиннее любого разумного окна. Всё
+        // остальное закрывает — искать нужную клавишу, чтобы убрать
+        // подсказку, отдельное издевательство.
+        match key.code {
+            KeyCode::Down => state.help_scroll = (state.help_scroll + 1).min(HELP.len()),
+            KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+            KeyCode::PageDown => {
+                state.help_scroll = (state.help_scroll + SCROLL_STEP).min(HELP.len());
+            }
+            KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(SCROLL_STEP),
+            _ => state.help = false,
         }
         return Vec::new();
     }
@@ -1722,7 +2314,7 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
 
         match key.code {
             KeyCode::Esc => state.picking = None,
-            KeyCode::Char('c' | 'd') if ctrl => {
+            KeyCode::Char('c' | 'd' | 'q') if ctrl => {
                 state.should_quit = true;
                 return vec![Command::Quit];
             }
@@ -1782,12 +2374,20 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         // Отдельная клавиша для файла: набирать «/send» ради выбора картинки
         // всё-таки лишний шаг.
         KeyCode::Char('o') if ctrl => return send_command(state, ""),
+        // Колонка с людьми: в узком окне она отнимает у переписки пятую часть
+        // ширины, в широком — просто занимает пустое место справа. Кому как
+        // удобнее, тот так и оставит.
+        KeyCode::Char('p') if ctrl => {
+            state.sidebar = !state.sidebar;
+            return vec![Command::SaveConfig];
+        }
 
         // Функциональный ряд — для тех, кто не собирается учить команды.
         // Всё, ради чего люди открывают чат, должно делаться одной подписанной
         // клавишей, а не строкой, начинающейся со слэша.
         KeyCode::F(1) => {
             state.help = true;
+            state.help_scroll = 0;
             return Vec::new();
         }
         // Одна клавиша на запись и отправку: во время записи всё равно ничем
@@ -1811,16 +2411,14 @@ fn on_chat_key(state: &mut State, key: KeyEvent) -> Vec<Command> {
         }
         KeyCode::F(5) => return save_command(state, ""),
         KeyCode::F(6) => return open_command(state),
-        // Пока ответ взведён, Esc снимает его, а не выходит из программы.
+        // Пока ответ взведён, Esc снимает его, а не уводит из комнаты.
         KeyCode::Esc if state.replying.is_some() => {
             state.replying = None;
             return Vec::new();
         }
-        KeyCode::Esc => {
-            state.should_quit = true;
-            return vec![Command::Quit];
-        }
-        KeyCode::Char('c' | 'd') if ctrl => {
+        // Esc — «назад»: из комнаты в меню, а не из программы наружу.
+        KeyCode::Esc => return to_home(state),
+        KeyCode::Char('c' | 'd' | 'q') if ctrl => {
             state.should_quit = true;
             return vec![Command::Quit];
         }
@@ -1920,12 +2518,14 @@ fn run_command(state: &mut State, line: &str) -> Vec<Command> {
     match name.as_str() {
         "help" | "?" => {
             state.help = true;
+            state.help_scroll = 0;
             Vec::new()
         }
         "quit" | "exit" => {
             state.should_quit = true;
             vec![Command::Quit]
         }
+        "menu" => to_home(state),
         "clear" => {
             state.entries.clear();
             state.seen.clear();
@@ -2268,11 +2868,9 @@ fn on_net(state: &mut State, event: NetEvent) -> Vec<Command> {
                 nickname: Input::new(state.nickname.clone()),
                 room: Input::new(state.room.clone()),
                 server: Input::new(state.server.clone()),
-                field: Field::Nickname,
                 error: Some(reason),
-                rooms: Vec::new(),
-                rooms_selected: None,
                 rooms_note: Some("спрашиваю сервер о комнатах…".to_string()),
+                ..Login::default()
             });
             state.users.clear();
             // Вернулись на экран входа — заодно освежаем список комнат: адрес
@@ -2295,7 +2893,11 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
             nickname,
             users,
             history,
+            upload_limit,
         } => {
+            // Потолок задаёт сервер: у чужого он может быть и меньше нашего,
+            // и больше, а гадать по своей константе — врать человеку.
+            state.upload_limit = upload_limit as usize;
             let reconnected = state.me.is_some();
             state.me = Some(your_id);
             state.room = room.clone();
@@ -2318,7 +2920,9 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
 
             if mentioned {
                 // Пока нас не было, нас звали — стоит об этом сообщить.
-                commands.push(Command::Bell);
+                if state.audio.chime {
+                    commands.push(Command::Bell);
+                }
             }
             if reconnected {
                 state.system(SystemKind::Info, "соединение восстановлено");
@@ -2354,7 +2958,7 @@ fn on_server(state: &mut State, msg: ServerMessage) -> Vec<Command> {
                 .insert(user.id, (user.nickname, Instant::now()));
         }
         ServerMessage::Chat(message) => {
-            if state.push_chat(message) {
+            if state.push_chat(message) && state.audio.chime {
                 commands.push(Command::Bell);
             }
         }
@@ -2411,6 +3015,7 @@ mod tests {
                 nickname: "alice".into(),
                 users: vec![],
                 history: vec![],
+                upload_limit: validate::MAX_UPLOAD_BYTES as u64,
             })),
         );
         (state, me)
@@ -2503,10 +3108,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_login_fields() {
+    fn arrows_walk_the_login_fields() {
+        // Tab переключает вкладки, поэтому по полям ходят стрелки: у клавиши
+        // не должно быть двух смыслов на одном экране.
         let (mut state, _) = State::new(None, "general".into());
         typed(&mut state, "alice");
-        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Down));
         update(&mut state, ctrl('u'));
         typed(&mut state, "rust");
 
@@ -2535,6 +3142,7 @@ mod tests {
                     chat_message(bob.clone(), "первое"),
                     chat_message(bob, "второе"),
                 ],
+                upload_limit: validate::MAX_UPLOAD_BYTES as u64,
             })),
         );
 
@@ -2569,6 +3177,7 @@ mod tests {
                 nickname: "alice".into(),
                 users: vec![bob.clone()],
                 history: vec![message, chat_message(bob, "пропущенное")],
+                upload_limit: validate::MAX_UPLOAD_BYTES as u64,
             })),
         );
 
@@ -2755,9 +3364,12 @@ mod tests {
         state.prefill_nickname("alice");
         update(&mut state, Action::Rooms(Ok(some_rooms())));
 
-        // Стрелка вниз выбирает первую комнату, вниз ещё раз — вторую.
-        update(&mut state, key(KeyCode::Down));
-        update(&mut state, key(KeyCode::Down));
+        // Стрелки идут по форме сверху вниз и с последнего поля спускаются
+        // в список: три шага по полям, четвёртый — первая комната, пятый —
+        // вторая.
+        for _ in 0..5 {
+            update(&mut state, key(KeyCode::Down));
+        }
         let commands = update(&mut state, key(KeyCode::Enter));
 
         assert!(
@@ -2776,10 +3388,14 @@ mod tests {
         let (mut state, _) = State::new(None, "general".into());
         state.prefill_nickname("alice");
         update(&mut state, Action::Rooms(Ok(some_rooms())));
-        update(&mut state, key(KeyCode::Down)); // выбрали «rust»
+        for _ in 0..4 {
+            update(&mut state, key(KeyCode::Down)); // выбрали «rust»
+        }
 
-        // Переходим в поле «комната» и дописываем — выбор из списка снимается.
-        update(&mut state, key(KeyCode::Tab)); // ник -> комната
+        // Возвращаемся в поле «комната» и дописываем — выбор снимается.
+        for _ in 0..3 {
+            update(&mut state, key(KeyCode::Up));
+        }
         typed(&mut state, "x");
         let commands = update(&mut state, key(KeyCode::Enter));
 
@@ -2793,11 +3409,135 @@ mod tests {
     }
 
     #[test]
+    fn the_host_tab_raises_a_server_without_leaving_the_screen() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, key(KeyCode::Tab)); // войти -> поднять
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(commands, [Command::Host(DEFAULT_PORT)]);
+        // Занятый порт — обычное дело: пока сервер не встал, человек остаётся
+        // там, где набирал, а не оказывается в переписке без связи.
+        let Screen::Login(login) = &state.screen else {
+            panic!("ушли с главного экрана раньше времени");
+        };
+        assert!(login.busy.is_some());
+    }
+
+    #[test]
+    fn a_busy_port_is_reported_on_the_form() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Enter));
+
+        update(&mut state, Action::Notice("порт занят".into()));
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("не главный экран");
+        };
+        assert_eq!(login.error.as_deref(), Some("порт занят"));
+        assert!(login.busy.is_none(), "спиннер должен погаснуть");
+        // И повторный Enter снова пробует: экран не заперт.
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter)),
+            [Command::Host(DEFAULT_PORT)]
+        );
+    }
+
+    #[test]
+    fn a_raised_server_takes_you_into_the_chat() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Enter));
+
+        let commands = update(
+            &mut state,
+            Action::Hosted {
+                url: "ws://127.0.0.1:8080/ws".into(),
+                lines: vec!["друг подключается: 192.168.1.5:8080".into()],
+            },
+        );
+
+        assert!(matches!(state.screen, Screen::Chat));
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Connect { nickname, room, .. }] if nickname == "alice" && room == "general"
+        ));
+    }
+
+    #[test]
+    fn a_bad_port_never_reaches_the_network() {
+        let (mut state, _) = State::new(None, "general".into());
+        state.prefill_nickname("alice");
+        update(&mut state, key(KeyCode::Tab));
+        // Стираем порт: пустое поле — не число.
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, ctrl('u'));
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(commands.is_empty());
+        let Screen::Login(login) = &state.screen else {
+            panic!("не главный экран");
+        };
+        assert_eq!(login.field, Field::Port);
+        assert!(login.error.is_some());
+    }
+
+    #[test]
+    fn the_port_field_takes_digits_only() {
+        let (mut state, _) = State::new(None, "general".into());
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, ctrl('u'));
+        typed(&mut state, "80п8");
+
+        let Screen::Login(login) = &state.screen else {
+            panic!("не главный экран");
+        };
+        assert_eq!(login.port.text, "808");
+    }
+
+    #[test]
+    fn the_look_tab_changes_the_theme_and_remembers_it() {
+        let (mut state, _) = State::new(None, "general".into());
+        for _ in 0..2 {
+            update(&mut state, key(KeyCode::Tab)); // войти -> поднять -> вид
+        }
+
+        let commands = update(&mut state, key(KeyCode::Right));
+
+        assert_eq!(state.theme, crate::theme::Theme::default().shift(false));
+        // Выбор переживает перезапуск — значит, его надо записать на диск.
+        assert_eq!(commands, [Command::SaveConfig]);
+    }
+
+    #[test]
+    fn the_look_tab_walks_its_rows() {
+        let (mut state, _) = State::new(None, "general".into());
+        for _ in 0..2 {
+            update(&mut state, key(KeyCode::Tab));
+        }
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Enter));
+
+        // Вторая строка — картинки в ленте: Enter листает её так же, как ←→.
+        assert_eq!(state.images_choice, Some(true));
+    }
+
+    #[test]
     fn arrow_up_from_the_top_returns_focus_to_the_form() {
         let (mut state, _) = State::new(None, "general".into());
         update(&mut state, Action::Rooms(Ok(some_rooms())));
 
-        update(&mut state, key(KeyCode::Down)); // выбор -> 0
+        for _ in 0..3 {
+            update(&mut state, key(KeyCode::Down)); // по полям и в список
+        }
         update(&mut state, key(KeyCode::Up)); // с нулевой обратно на форму
 
         let Screen::Login(login) = &state.screen else {
@@ -3356,15 +4096,98 @@ mod tests {
     }
 
     #[test]
-    fn esc_and_ctrl_c_request_shutdown() {
-        for action in [key(KeyCode::Esc), ctrl('c')] {
+    fn only_a_deliberate_shortcut_closes_the_program() {
+        for shortcut in ['c', 'd', 'q'] {
             let (mut state, _) = connected();
 
-            let commands = update(&mut state, action);
+            let commands = update(&mut state, ctrl(shortcut));
 
-            assert_eq!(commands, [Command::Quit]);
-            assert!(state.should_quit);
+            assert_eq!(commands, [Command::Quit], "ctrl+{shortcut}");
+            assert!(state.should_quit, "ctrl+{shortcut}");
         }
+    }
+
+    #[test]
+    fn arrows_scroll_the_help_and_anything_else_closes_it() {
+        let (mut state, _) = connected();
+        update(&mut state, key(KeyCode::F(1)));
+
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
+
+        // Список длиннее любого разумного окна: стрелки должны листать его,
+        // а не закрывать.
+        assert!(state.help);
+        assert_eq!(state.help_scroll, 2);
+
+        update(&mut state, key(KeyCode::Up));
+        assert_eq!(state.help_scroll, 1);
+
+        update(&mut state, key(KeyCode::Char('x')));
+        assert!(!state.help);
+
+        // Открытая заново справка начинается сначала.
+        update(&mut state, key(KeyCode::F(1)));
+        assert_eq!(state.help_scroll, 0);
+    }
+
+    #[test]
+    fn esc_leaves_the_room_for_the_menu() {
+        let (mut state, _) = connected();
+
+        let commands = update(&mut state, key(KeyCode::Esc));
+
+        // Esc — «назад», а не «выход»: программа остаётся открытой, а
+        // соединение с комнатой закрывается.
+        assert!(!state.should_quit);
+        assert!(matches!(state.screen, Screen::Login(_)));
+        assert!(commands.contains(&Command::Disconnect), "{commands:?}");
+        // Поля заполнены тем, чем человек только что пользовался.
+        let Screen::Login(login) = &state.screen else {
+            panic!("не главный экран");
+        };
+        assert_eq!(login.nickname.text, "alice");
+        assert_eq!(login.room.text, "general");
+    }
+
+    #[test]
+    fn the_menu_command_does_the_same() {
+        let (mut state, _) = connected();
+        typed(&mut state, "/menu");
+
+        let commands = update(&mut state, key(KeyCode::Enter));
+
+        assert!(matches!(state.screen, Screen::Login(_)));
+        assert!(commands.contains(&Command::Disconnect), "{commands:?}");
+    }
+
+    #[test]
+    fn esc_on_the_home_screen_returns_to_the_first_tab() {
+        let (mut state, _) = State::new(None, "general".into());
+        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Tab));
+
+        let commands = update(&mut state, key(KeyCode::Esc));
+
+        // Программа не закрывается: на главном экране Esc — тоже «назад».
+        assert!(commands.is_empty());
+        assert!(!state.should_quit);
+        let Screen::Login(login) = &state.screen else {
+            panic!("не главный экран");
+        };
+        assert_eq!(login.tab, HomeTab::Join);
+    }
+
+    #[test]
+    fn leaving_for_the_menu_keeps_the_conversation() {
+        let (mut state, _) = connected();
+        let before = state.entries.len();
+
+        update(&mut state, key(KeyCode::Esc));
+
+        // Переписка остаётся в памяти: вернувшись в ту же комнату, человек
+        // увидит, на чём остановились.
+        assert_eq!(state.entries.len(), before);
     }
 
     /// Комната с несколькими репликами и заполненной картой строк:
@@ -3670,6 +4493,7 @@ mod tests {
                 nickname: "alice".into(),
                 users: vec![],
                 history: vec![],
+                upload_limit: validate::MAX_UPLOAD_BYTES as u64,
             })),
         );
 
@@ -4350,8 +5174,8 @@ mod tests {
         let (mut state, _) = State::new(None, "general".into());
         state.set_server(crate::net::DEFAULT_SERVER.to_string());
         typed(&mut state, "alice");
-        update(&mut state, key(KeyCode::Tab));
-        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
         update(&mut state, ctrl('u'));
         // Ровно то, что присылают в мессенджере.
         typed(&mut state, "192.168.1.5:8080");
@@ -4369,8 +5193,8 @@ mod tests {
         let (mut state, _) = State::new(None, "general".into());
         state.set_server(crate::net::DEFAULT_SERVER.to_string());
         typed(&mut state, "alice");
-        update(&mut state, key(KeyCode::Tab));
-        update(&mut state, key(KeyCode::Tab));
+        update(&mut state, key(KeyCode::Down));
+        update(&mut state, key(KeyCode::Down));
         update(&mut state, ctrl('u'));
         typed(&mut state, "ws://");
 

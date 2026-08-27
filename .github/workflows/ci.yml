@@ -1,0 +1,36 @@
+# Проверки на каждый push и pull request.
+#
+# Одна платформа, а не три: тесты здесь про логику и протокол, а не про
+# особенности систем. Кросс-сборку делает `release.yml` — там она и к месту.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Поставить Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ALSA нужна rodio: без её заголовков падает линковка, а не код.
+      - name: Заголовки ALSA
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Форматирование
+        run: cargo fmt --all --check
+
+      # Предупреждения здесь — ошибки: иначе они копятся, и на них перестают
+      # смотреть.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Тесты
+        run: cargo test --workspace
