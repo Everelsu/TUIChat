@@ -593,7 +593,7 @@ fn draw_login(frame: &mut Frame, login: &Login, area: Rect) {
     frame.render_widget(Paragraph::new(Span::styled("ник", label)), rows[1]);
     frame.render_widget(Paragraph::new(Span::styled("комната", label)), rows[3]);
     frame.render_widget(
-        Paragraph::new(Span::styled("сервер — можно вставить адрес друга", label)),
+        Paragraph::new(Span::styled("сервер — адрес или тикет друга", label)),
         rows[5],
     );
 

@@ -22,7 +22,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
+    WebSocketStream,
     tungstenite::{Error as WsError, Message as WsMessage, protocol::WebSocketConfig},
 };
 
@@ -72,6 +72,15 @@ pub fn normalize_server(value: &str) -> Result<String, String> {
     // Схему отделяем до обрезки слэшей: иначе «ws://» превращается в «ws:»
     // и разбирается как имя узла.
     let value = value.trim();
+
+    // Тикет адресом не является и приводить его к виду `ws://…` нельзя: это
+    // ключ, по которому собеседника ещё только предстоит найти. Проверяем до
+    // всего остального, иначе он превратился бы в имя узла.
+    if crate::tunnel::looks_like_ticket(value) {
+        crate::tunnel::parse_ticket(value)?;
+        return Ok(value.to_string());
+    }
+
     let (scheme, rest) = if let Some(rest) = value.strip_prefix("wss://") {
         ("wss", rest)
     } else if let Some(rest) = value.strip_prefix("ws://") {
@@ -106,6 +115,12 @@ pub fn normalize_server(value: &str) -> Result<String, String> {
 /// http-адрес сервера, выведенный из адреса WebSocket: по нему клиент строит
 /// ссылки на вложения, не спрашивая их отдельным параметром.
 pub fn media_base(ws_url: &str) -> String {
+    // Через туннель вложения ходят по той же трубе, что и переписка: своей
+    // схемой помечаем, что обычным http сюда не достучаться.
+    if crate::tunnel::looks_like_ticket(ws_url) {
+        return format!("iroh://{}", ws_url.trim());
+    }
+
     let base = ws_url.trim_end_matches("/ws");
     if let Some(rest) = base.strip_prefix("wss://") {
         format!("https://{rest}")
@@ -279,16 +294,61 @@ async fn wait_before_retry(wait: Duration, outgoing: &mut UnboundedReceiver<Outg
     }
 }
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// Труба, по которой идёт WebSocket: обычный TCP или поток через iroh.
+///
+/// Тип один на оба случая, потому что дальше разницы нет никакой — и сессия,
+/// и разбор кадров устроены одинаково. Различие живёт ровно в одном месте:
+/// в `connect`.
+pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport for T {}
+
+type Socket = WebSocketStream<Box<dyn Transport>>;
 type Sink = SplitSink<Socket, WsMessage>;
 
 async fn connect(config: &NetConfig) -> Result<Socket, WsError> {
     // Тот же потолок на кадр, что и у сервера: клиент тоже не должен падать
     // по памяти из-за одного гигантского сообщения.
     let ws_config = WebSocketConfig::default().max_message_size(Some(validate::MAX_FRAME_BYTES));
+
+    // Тикет вместо адреса означает «через туннель»: у друга дома нет ни
+    // публичного адреса, ни проброшенного порта, и стучаться к нему напрямую
+    // некуда. Всё остальное — обычный TCP.
+    let (transport, request): (Box<dyn Transport>, String) =
+        if crate::tunnel::looks_like_ticket(&config.url) {
+            let duplex = crate::tunnel::connect(&config.url)
+                .await
+                .map_err(|reason| WsError::Io(std::io::Error::other(reason)))?;
+            // Адрес в запросе формальный: на том конце трубы нас ждёт свой же
+            // сервер, и разбирать имя узла ему незачем.
+            (Box::new(duplex), "ws://localhost/ws".to_string())
+        } else {
+            let authority = authority_of(&config.url)?;
+            let tcp = TcpStream::connect(&authority).await.map_err(WsError::Io)?;
+            // Задержку Нейгла снимаем: реплики короткие, и склеивать их ради
+            // экономии на заголовках значит добавлять к каждой десятки
+            // миллисекунд ожидания.
+            let _ = tcp.set_nodelay(true);
+            (Box::new(tcp), config.url.clone())
+        };
+
     let (socket, _) =
-        tokio_tungstenite::connect_async_with_config(&config.url, Some(ws_config), false).await?;
+        tokio_tungstenite::client_async_with_config(request, transport, Some(ws_config)).await?;
     Ok(socket)
+}
+
+/// Достаёт `host:port` из адреса вида `ws://host:port/path`.
+fn authority_of(url: &str) -> Result<String, WsError> {
+    let rest = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+        .unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(WsError::Io(std::io::Error::other(
+            "не указан адрес сервера",
+        )));
+    }
+    Ok(authority.to_string())
 }
 
 async fn session(

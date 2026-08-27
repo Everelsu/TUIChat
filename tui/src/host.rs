@@ -13,6 +13,11 @@ pub struct Hosted {
     /// Куда подключается собственный клиент.
     pub url: String,
     pub port: u16,
+    /// Тикет для друга из другой сети. `None` — туннель поднять не вышло:
+    /// в локальной сети чат всё равно работает, поэтому это не отказ.
+    pub ticket: Option<String>,
+    /// Туннель нужно держать живым: с его смертью закрывается труба.
+    _tunnel: Option<crate::tunnel::Tunnel>,
 }
 
 /// Поднимает сервер на указанном порту.
@@ -25,9 +30,17 @@ pub async fn start(port: u16) -> io::Result<Hosted> {
         let _ = axum::serve(listener, server::app()).await;
     });
 
+    // Туннель поднимаем сразу: без него друг из другого дома не подключится
+    // никак, а узнать об этом в момент, когда он уже ждёт приглашения, —
+    // худший из возможных вариантов. Не вышло — молчим и работаем по сети:
+    // отказываться поднимать комнату из-за этого не за что.
+    let tunnel = crate::tunnel::serve(port).await.ok();
+
     Ok(Hosted {
         url: format!("ws://127.0.0.1:{port}/ws"),
         port,
+        ticket: tunnel.as_ref().map(|tunnel| tunnel.ticket.clone()),
+        _tunnel: tunnel,
     })
 }
 
@@ -38,14 +51,24 @@ impl Hosted {
     /// человек, — «а куда подключаться».
     pub fn invitations(&self) -> Vec<String> {
         let mut lines = vec![format!("сервер поднят здесь же, порт {}", self.port)];
+
+        // Тикет первым: это единственная строка, которая работает откуда
+        // угодно, а адрес в локальной сети — только для тех, кто рядом.
+        match &self.ticket {
+            Some(ticket) => {
+                lines.push("друг из любой сети — пусть вставит это в «сервер»:".to_string());
+                lines.push(ticket.clone());
+            }
+            None => lines.push(
+                "туннель не поднялся: снаружи не подключиться, только по сети ниже".to_string(),
+            ),
+        }
+
         for ip in server::tls::local_ips() {
             lines.push(format!(
-                "друг подключается: --server ws://{ip}:{}/ws · с телефона http://{ip}:{}",
+                "кто рядом: --server ws://{ip}:{}/ws · с телефона http://{ip}:{}",
                 self.port, self.port
             ));
-        }
-        if lines.len() == 1 {
-            lines.push("сети не видно — снаружи подключиться не получится".to_string());
         }
         lines
     }

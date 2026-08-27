@@ -424,11 +424,7 @@ fn toggle_recording(sound: &mut Sound, state: &mut State, actions: UnboundedSend
 
     let base = state.media_base.clone();
     tokio::spawn(async move {
-        let work =
-            tokio::task::spawn_blocking(move || media::upload_bytes(&base, "голосовое.wav", bytes));
-        let result = work
-            .await
-            .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")));
+        let result = media::upload_any(base, "голосовое.wav".to_string(), bytes).await;
         let _ = actions.send(Action::Uploaded(result));
     });
 }
@@ -442,6 +438,11 @@ fn host_here(port: u16, actions: UnboundedSender<Action>) {
                     url: hosted.url.clone(),
                     lines: hosted.invitations(),
                 });
+                // Держим поднятое живым до конца работы: уронив `Hosted`,
+                // мы закрыли бы туннель, и друг остался бы с тикетом,
+                // по которому уже никто не отвечает.
+                let _hosted = hosted;
+                std::future::pending::<()>().await;
             }
             Err(err) => {
                 let _ = actions.send(Action::Notice(format!(
@@ -460,14 +461,10 @@ fn host_here(port: u16, actions: UnboundedSender<Action>) {
 fn fetch_rooms(base: String, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
         let url = format!("{}/rooms", base.trim_end_matches('/'));
-        let work = tokio::task::spawn_blocking(move || {
-            let bytes = media::fetch(&url)?;
+        let result = media::fetch_any(url).await.and_then(|bytes| {
             serde_json::from_slice::<Vec<common::RoomSummary>>(&bytes)
                 .map_err(|err| format!("сервер ответил не списком комнат: {err}"))
         });
-        let result = work
-            .await
-            .unwrap_or_else(|err| Err(format!("запрос комнат сорвался: {err}")));
         let _ = actions.send(Action::Rooms(result));
     });
 }
@@ -490,10 +487,7 @@ fn read_dir(path: PathBuf, actions: UnboundedSender<Action>) {
 /// Качает голосовое и отдаёт байты главному циклу.
 fn fetch_voice(url: String, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
-        let work = tokio::task::spawn_blocking(move || media::fetch(&url));
-        let result = work
-            .await
-            .unwrap_or_else(|err| Err(format!("скачивание сорвалось: {err}")));
+        let result = media::fetch_any(url).await;
         let _ = actions.send(Action::Voice(result));
     });
 }
@@ -501,21 +495,22 @@ fn fetch_voice(url: String, actions: UnboundedSender<Action>) {
 /// Скачивает вложение и кладёт его на диск.
 fn save_file(url: String, destination: PathBuf, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
-        let work = tokio::task::spawn_blocking(move || {
-            let bytes = media::fetch(&url)?;
-            if let Some(parent) = destination.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| format!("не удалось создать каталог: {err}"))?;
-            }
-            std::fs::write(&destination, bytes)
-                .map_err(|err| format!("не удалось записать файл: {err}"))?;
-            Ok(destination)
-        });
-        let result = work
+        let result = match media::fetch_any(url).await {
+            Ok(bytes) => tokio::task::spawn_blocking(move || {
+                if let Some(parent) = destination.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|err| format!("не удалось создать каталог: {err}"))?;
+                }
+                std::fs::write(&destination, bytes)
+                    .map_err(|err| format!("не удалось записать файл: {err}"))?;
+                Ok(destination)
+            })
             .await
-            .unwrap_or_else(|err| Err(format!("сохранение сорвалось: {err}")));
+            .unwrap_or_else(|err| Err(format!("сохранение сорвалось: {err}"))),
+            Err(reason) => Err(reason),
+        };
         let _ = actions.send(Action::Saved(result));
     });
 }
@@ -523,10 +518,23 @@ fn save_file(url: String, destination: PathBuf, actions: UnboundedSender<Action>
 /// Отправляет файл на сервер в отдельном потоке.
 fn upload_file(base: String, path: std::path::PathBuf, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
-        let work = tokio::task::spawn_blocking(move || media::upload(&base, &path));
-        let result = work
-            .await
-            .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")));
+        // Читаем файл отдельным потоком: на сетевом диске это думает секундами.
+        let read = tokio::task::spawn_blocking(move || {
+            let bytes =
+                std::fs::read(&path).map_err(|err| format!("не удалось прочитать файл: {err}"))?;
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "файл".to_string());
+            Ok::<_, String>((name, bytes))
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")));
+
+        let result = match read {
+            Ok((name, bytes)) => media::upload_any(base, name, bytes).await,
+            Err(reason) => Err(reason),
+        };
         let _ = actions.send(Action::Uploaded(result));
     });
 }
@@ -537,17 +545,15 @@ fn upload_file(base: String, path: std::path::PathBuf, actions: UnboundedSender<
 /// отвечать: результат прилетит обычным действием, как сообщение из сети.
 fn fetch_image(id: uuid::Uuid, url: String, actions: UnboundedSender<Action>) {
     tokio::spawn(async move {
-        let work = tokio::task::spawn_blocking(move || {
-            media::fetch(&url)
-                .and_then(|bytes| media::decode(&bytes))
-                .map(Box::new)
-        });
-
-        // Разборщики чужих форматов на битом файле иногда паникуют. Без этой
-        // ветки просмотр навсегда застревал бы на «загружаю…».
-        let result = work
-            .await
-            .unwrap_or_else(|err| Err(format!("разбор картинки сорвался: {err}")));
+        let result = match media::fetch_any(url).await {
+            // Разборщики чужих форматов на битом файле иногда паникуют. Без
+            // отдельного потока и этой ветки просмотр навсегда застревал бы
+            // на «загружаю…».
+            Ok(bytes) => tokio::task::spawn_blocking(move || media::decode(&bytes).map(Box::new))
+                .await
+                .unwrap_or_else(|err| Err(format!("разбор картинки сорвался: {err}"))),
+            Err(reason) => Err(reason),
+        };
         let _ = actions.send(Action::Image(id, result));
     });
 }

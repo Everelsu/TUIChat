@@ -101,6 +101,107 @@ pub fn upload_bytes(base: &str, name: &str, bytes: Vec<u8>) -> Result<Attachment
     serde_json::from_slice(&body).map_err(|err| format!("непонятный ответ сервера: {err}"))
 }
 
+/// Схема, которой помечен адрес, доступный только через туннель.
+const TUNNEL: &str = "iroh://";
+
+/// Разбирает `iroh://<тикет>/путь` на тикет и путь.
+fn split_tunnel(url: &str) -> Option<(&str, String)> {
+    let rest = url.strip_prefix(TUNNEL)?;
+    match rest.split_once('/') {
+        Some((ticket, path)) => Some((ticket, format!("/{path}"))),
+        None => Some((rest, "/".to_string())),
+    }
+}
+
+/// Качает вложение, откуда бы оно ни лежало: по обычному http или через
+/// туннель.
+///
+/// Разделение спрятано здесь, а не разбросано по вызывающим: тем всё равно,
+/// каким путём пришли байты.
+pub async fn fetch_any(url: String) -> Result<Vec<u8>, String> {
+    if let Some((ticket, path)) = split_tunnel(&url) {
+        let request = format!(
+            "GET {path} HTTP/1.1
+Host: localhost
+Accept: */*
+Connection: close
+
+"
+        );
+        return through_tunnel(ticket, request.into_bytes(), Vec::new()).await;
+    }
+
+    // Обычный http блокирует, поэтому уходит в отдельный поток: интерфейс
+    // должен продолжать отвечать.
+    tokio::task::spawn_blocking(move || fetch(&url))
+        .await
+        .unwrap_or_else(|err| Err(format!("скачивание сорвалось: {err}")))
+}
+
+/// Отправляет файл — по http или через туннель.
+pub async fn upload_any(base: String, name: String, bytes: Vec<u8>) -> Result<Attachment, String> {
+    if bytes.len() > validate::MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "файл слишком большой: {} КБ при потолке {} КБ",
+            bytes.len() / 1024,
+            validate::MAX_UPLOAD_BYTES / 1024
+        ));
+    }
+
+    if let Some((ticket, _)) = split_tunnel(&base) {
+        let head = format!(
+            "POST /upload?name={} HTTP/1.1
+Host: localhost
+Content-Length: {}
+Connection: close
+
+",
+            escape(&name),
+            bytes.len()
+        );
+        let body = through_tunnel(ticket, head.into_bytes(), bytes).await?;
+        return serde_json::from_slice(&body)
+            .map_err(|err| format!("непонятный ответ сервера: {err}"));
+    }
+
+    tokio::task::spawn_blocking(move || upload_bytes(&base, &name, bytes))
+        .await
+        .unwrap_or_else(|err| Err(format!("отправка сорвалась: {err}")))
+}
+
+/// Один HTTP-запрос через трубу: пишем запрос, дочитываем ответ до конца.
+///
+/// Каждый раз новый поток, а не общий с перепиской: смешивать в одном потоке
+/// кадры WebSocket и HTTP нельзя, да и качать вложение параллельно разговору
+/// иначе не вышло бы.
+async fn through_tunnel(ticket: &str, head: Vec<u8>, body: Vec<u8>) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut duplex = crate::tunnel::connect(ticket).await?;
+    duplex
+        .write_all(&head)
+        .await
+        .map_err(|err| format!("не удалось отправить запрос: {err}"))?;
+    if !body.is_empty() {
+        duplex
+            .write_all(&body)
+            .await
+            .map_err(|err| format!("не удалось отправить файл: {err}"))?;
+    }
+    duplex
+        .flush()
+        .await
+        .map_err(|err| format!("не удалось отправить запрос: {err}"))?;
+
+    let mut response = Vec::new();
+    duplex
+        .read_to_end(&mut response)
+        .await
+        .map_err(|err| format!("не удалось прочитать ответ: {err}"))?;
+
+    split_response(&response)
+}
+
 /// Экранирует имя файла для строки запроса: в нём бывают пробелы и кириллица.
 fn escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());

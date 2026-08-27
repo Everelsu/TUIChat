@@ -21,6 +21,7 @@ toml = "1.1.4"
 unicode-width = "0.2.2"
 uuid.workspace = true
 axum = "0.8.9"
+iroh = "1.1.0"
 
 [dev-dependencies]
 axum = "0.8.9"

@@ -13,4 +13,5 @@ pub mod launcher;
 pub mod media;
 pub mod net;
 pub mod sound;
+pub mod tunnel;
 pub mod ui;
